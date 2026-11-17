@@ -2155,10 +2155,15 @@ var BotManager = class {
       return { slDist: price * slPct / 100, tpDist: price * tpPct / 100 };
     }
     const minStopPct = Math.max(0.3, Number(process.env.MIN_STOP_PCT) || 2);
+    const maxStopPct = Math.max(1, Number(process.env.MAX_STOP_PCT) || 6);
+    const maxTargetPct = Math.max(3, Number(process.env.MAX_TARGET_PCT) || 18);
     const atrSl = atr * (bot.slAtrMult || 3);
     const atrTp = atr * (bot.tpAtrMult || 9);
-    const slDist = Math.max(atrSl, price * minStopPct / 100);
-    const tpDist = Math.max(atrTp, slDist * 3);
+    const slDist = Math.min(
+      Math.max(atrSl, price * minStopPct / 100),
+      price * maxStopPct / 100
+    );
+    const tpDist = Math.min(Math.max(atrTp, slDist * 3), price * maxTargetPct / 100);
     return { slDist, tpDist };
   }
   /** Fixed-risk sizing: size the trade so that hitting the stop costs exactly riskPerTradePct of equity */
@@ -2423,7 +2428,16 @@ var BotManager = class {
     const interval = Math.max(10, Number(bot.scanIntervalSec) || 25) * 1e3;
     if (bot.lastScanAt && now - bot.lastScanAt < interval) return bot;
     const allSymbols = marketService.getAllTickers().map((t) => t.symbol);
-    const symbols = Array.isArray(bot.universe) && bot.universe.length ? bot.universe : allSymbols;
+    let symbols = Array.isArray(bot.universe) && bot.universe.length ? bot.universe : allSymbols;
+    const batch = Math.max(4, Math.min(symbols.length, Number(bot.scanBatch) || 20));
+    if (symbols.length > batch) {
+      bot._scanCursor = (Number(bot._scanCursor) || 0) % symbols.length;
+      const slice = [];
+      for (let i = 0; i < batch; i++) slice.push(symbols[(bot._scanCursor + i) % symbols.length]);
+      bot._scanCursor = (bot._scanCursor + batch) % symbols.length;
+      const held2 = tradingEngine.state.positions.filter((p) => p.botId === bot.id).map((p) => p.symbol);
+      symbols = [.../* @__PURE__ */ new Set([...held2, ...slice])];
+    }
     const timeframes = Array.isArray(bot.timeframes) && bot.timeframes.length ? bot.timeframes : ["15m", "1h"];
     const strategies = Array.isArray(bot.strategies) && bot.strategies.length ? bot.strategies : ["ICT_SMART_MONEY", "AI_CONFLUENCE", "PRICE_ACTION", "GRID_BOT", "EMA_RSI", "RSI_REVERSION", "MACD_MOMENTUM", "BOLLINGER_BOUNCE"];
     const openByBot = tradingEngine.state.positions.filter((p) => p.botId === bot.id);
@@ -2874,7 +2888,7 @@ function readJsonBody(req) {
     req.on("error", reject);
   });
 }
-if (tradingEngine.state?.bots && !tradingEngine.state.bots.some((b) => b.strategy === "ICT_SMART_MONEY")) {
+if (tradingEngine.state?.bots && tradingEngine.state.omegaReset !== true && !tradingEngine.state.bots.some((b) => b.strategy === "ICT_SMART_MONEY")) {
   tradingEngine.state.bots.unshift({
     id: "BOT-ICT-00",
     name: "BTC ICT Smart Money (FVG)",
@@ -2898,7 +2912,7 @@ if (tradingEngine.state?.bots && !tradingEngine.state.bots.some((b) => b.strateg
   });
   tradingEngine.saveState();
 }
-if (tradingEngine.state?.bots && !tradingEngine.state.bots.some((b) => b.mode === "MULTI")) {
+if (tradingEngine.state?.bots && tradingEngine.state.omegaReset !== true && !tradingEngine.state.bots.some((b) => b.mode === "MULTI")) {
   try {
     botManager.createBot({
       name: "NEXUS HUNTER",
@@ -2946,7 +2960,52 @@ if (tradingEngine.state?.bots && !tradingEngine.state.bots.some((b) => b.mode ==
     console.log("Hunter seed skipped:", err.message);
   }
 }
-if (tradingEngine.state?.bots && !tradingEngine.state.bots.some((b) => b.pairHedge)) {
+if (tradingEngine.state && tradingEngine.state.omegaReset !== true) {
+  try {
+    tradingEngine.state.bots = [];
+    tradingEngine.state.positions = [];
+    tradingEngine.saveState();
+    const everySymbol = marketService.getAllTickers().map((t) => t.symbol);
+    botManager.createBot({
+      name: "NEXUS OMEGA \u2014 \u0647\u0645\u0647 \u0628\u0627\u0632\u0627\u0631\u0647\u0627",
+      mode: "MULTI",
+      sideMode: "BOTH",
+      allowShort: true,
+      universe: everySymbol,
+      // every tradable symbol
+      timeframes: ["1h", "4h"],
+      strategies: ["AI_CONFLUENCE", "ICT_SMART_MONEY", "DONCHIAN_BREAKOUT", "ADX_DI_TREND"],
+      minScore: 60,
+      // only high-conviction setups
+      maxOpenPositions: 10,
+      scanIntervalSec: 30,
+      symbolCooldownSec: 300,
+      marginPerTrade: 5,
+      allocationPct: 5,
+      leverage: 10,
+      useAtrStops: true,
+      slAtrMult: 3,
+      tpAtrMult: 9,
+      useTrendFilter: true,
+      useTrailing: true,
+      trailStartR: 3,
+      sizingMode: "RISK",
+      riskPerTradePct: 1,
+      status: "ACTIVE"
+    });
+    const omega = tradingEngine.state.bots[0];
+    if (omega) {
+      omega.scanBatch = 20;
+      omega.universe = everySymbol;
+    }
+    tradingEngine.state.omegaReset = true;
+    tradingEngine.saveState();
+    console.log(`OMEGA bot created \u2014 ${everySymbol.length} symbols, min score 60, long & short`);
+  } catch (err) {
+    console.log("OMEGA reset failed:", err.message);
+  }
+}
+if (tradingEngine.state?.bots && tradingEngine.state.omegaReset !== true && !tradingEngine.state.bots.some((b) => b.pairHedge)) {
   try {
     botManager.createBot({
       name: "HEDGE PAIR \u2014 \u062F\u0648\u0637\u0631\u0641\u0647",
@@ -2978,7 +3037,7 @@ if (tradingEngine.state?.bots && !tradingEngine.state.bots.some((b) => b.pairHed
     console.log("Hedge bot seed skipped:", err.message);
   }
 }
-if (tradingEngine.state?.bots && !tradingEngine.state.bots.some((b) => b.pairHedge && b.hedgeOcoOn === "TP_ONLY")) {
+if (tradingEngine.state?.bots && tradingEngine.state.omegaReset !== true && !tradingEngine.state.bots.some((b) => b.pairHedge && b.hedgeOcoOn === "TP_ONLY")) {
   try {
     botManager.createBot({
       name: "HEDGE RUNNER \u2014 \u0628\u0631\u0646\u062F\u0647 \u0627\u062F\u0627\u0645\u0647 \u0645\u06CC\u200C\u062F\u0647\u062F",
@@ -3012,7 +3071,7 @@ if (tradingEngine.state?.bots && !tradingEngine.state.bots.some((b) => b.pairHed
     console.log("Hedge runner seed skipped:", err.message);
   }
 }
-if (tradingEngine.state?.bots && !tradingEngine.state.bots.some((b) => b.sideMode === "SHORT_ONLY")) {
+if (tradingEngine.state?.bots && tradingEngine.state.omegaReset !== true && !tradingEngine.state.bots.some((b) => b.sideMode === "SHORT_ONLY")) {
   try {
     botManager.createBot({
       name: "SHORT SNIPER \u2014 \u0641\u0642\u0637 \u0641\u0631\u0648\u0634",
