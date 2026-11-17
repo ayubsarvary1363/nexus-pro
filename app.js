@@ -801,6 +801,20 @@ var TradingEngine = class {
       fs.mkdirSync(DATA_DIR, { recursive: true });
     }
     this.state = this.loadState();
+    try {
+      if (Array.isArray(this.state.tradeHistory)) {
+        const before = this.state.tradeHistory.length;
+        this.state.tradeHistory = this.state.tradeHistory.filter(
+          (t) => !String(t?.id || "").startsWith("TRD-SEED")
+        );
+        if (this.state.tradeHistory.length !== before) {
+          this.state.seedPurged = true;
+          this.saveState();
+          console.log(`[reset] removed ${before - this.state.tradeHistory.length} demo trades`);
+        }
+      }
+    } catch {
+    }
     setInterval(() => {
       this.evaluateTick();
     }, 1e3);
@@ -811,68 +825,7 @@ var TradingEngine = class {
   createDefaultState() {
     const now = Date.now();
     const hour = 3600 * 1e3;
-    const sampleHistory = [
-      {
-        id: "TRD-SEED-01",
-        symbol: "BTC/USD",
-        side: "LONG",
-        size: 15e-4,
-        entryPrice: 62850,
-        exitPrice: 63920,
-        leverage: 10,
-        margin: 9.4,
-        pnl: 1.51,
-        roePct: 16.05,
-        fee: 0.05,
-        reason: "TAKE_PROFIT",
-        source: "BOT",
-        botName: "BTC EMA-RSI Bot",
-        openedAt: now - 18 * hour,
-        closedAt: now - 14 * hour,
-        note: "\u0634\u06A9\u0633\u062A \u0645\u0642\u0627\u0648\u0645\u062A \u06F6\u06F3 \u0647\u0632\u0627\u0631 \u062F\u0644\u0627\u0631 \u0647\u0645\u0632\u0645\u0627\u0646 \u0628\u0627 \u06A9\u0631\u0627\u0633 \u0635\u0639\u0648\u062F\u06CC EMA 9/21",
-        tags: ["Breakout", "Bot"]
-      },
-      {
-        id: "TRD-SEED-02",
-        symbol: "XAU/USD",
-        side: "SHORT",
-        size: 0.15,
-        entryPrice: 3894.5,
-        exitPrice: 3877.2,
-        leverage: 20,
-        margin: 28.6,
-        pnl: 2.52,
-        roePct: 8.81,
-        fee: 0.29,
-        reason: "TAKE_PROFIT",
-        source: "BOT",
-        botName: "Gold Smart Confluence",
-        openedAt: now - 12 * hour,
-        closedAt: now - 9 * hour,
-        note: "\u0628\u0631\u06AF\u0634\u062A \u0627\u0632 \u0628\u0627\u0646\u062F \u0628\u0627\u0644\u0627\u06CC\u06CC \u0628\u0648\u0644\u06CC\u0646\u06AF\u0631 \u0647\u0645\u0631\u0627\u0647 \u0628\u0627 RSI \u0627\u0634\u0628\u0627\u0639 \u062E\u0631\u06CC\u062F",
-        tags: ["Gold", "Reversion"]
-      },
-      {
-        id: "TRD-SEED-03",
-        symbol: "EUR/USD",
-        side: "LONG",
-        size: 400,
-        entryPrice: 1.0985,
-        exitPrice: 1.1016,
-        leverage: 20,
-        margin: 22.03,
-        pnl: 1.24,
-        roePct: 5.63,
-        fee: 0.22,
-        reason: "BOT_SIGNAL",
-        source: "BOT",
-        botName: "Forex Confluence Bot",
-        openedAt: now - 3 * hour,
-        closedAt: now - 1 * hour,
-        note: "\u0633\u06CC\u06AF\u0646\u0627\u0644 \u0648\u0627\u06AF\u0631\u0627\u06CC\u06CC \u0645\u062B\u0628\u062A RSI \u062F\u0631 \u0633\u0634\u0646 \u0644\u0646\u062F\u0646/\u0646\u06CC\u0648\u06CC\u0648\u0631\u06A9",
-        tags: ["Forex", "Bot"]
-      }
-    ];
+    const sampleHistory = [];
     const netSeedPnl = Number(sampleHistory.reduce((s, t) => s + t.pnl, 0).toFixed(2));
     const initialBalance = Number(process.env.INITIAL_BALANCE) || 100;
     const currentBalance = initialBalance;
@@ -1085,7 +1038,7 @@ var TradingEngine = class {
     const grossLoss = Math.abs(losses.reduce((s, t) => s + t.pnl, 0));
     const realizedPnl = Number(history.reduce((s, t) => s + t.pnl, 0).toFixed(2));
     const winRate = history.length > 0 ? Number((wins.length / history.length * 100).toFixed(1)) : 0;
-    const profitFactor = grossLoss > 0 ? Number((grossProfit / grossLoss).toFixed(2)) : grossProfit > 0 ? 9.99 : 0;
+    const profitFactor = grossLoss > 0 ? Number((grossProfit / grossLoss).toFixed(2)) : grossProfit > 0 ? 99 : 0;
     return {
       initialBalance: this.state.initialBalance,
       walletBalance: totalWalletBalance,
