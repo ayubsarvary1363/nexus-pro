@@ -33317,7 +33317,8 @@ async function runCycle({ dryRun = true, scanResult = null } = {}) {
       actions.push({ coin: c.coin, action: "SKIP", reason: `\u0645\u0627\u0631\u062C\u06CC\u0646 \u0628\u06CC\u0634 \u0627\u0632 ${CFG.marginCapPct}\u066A \u0633\u0631\u0645\u0627\u06CC\u0647` });
       continue;
     }
-    const size = CFG.notionalUsd / c.price;
+    const targetNotional = CFG.notionalUsd * 1.02;
+    const size = targetNotional / c.price;
     const trade = {
       coin: c.coin,
       score: c.score,
@@ -33332,13 +33333,26 @@ async function runCycle({ dryRun = true, scanResult = null } = {}) {
       oids: {}
     };
     if (dryRun) {
+      const already = (st.trades || []).some((t) => t.status === "dry" && t.coin === c.coin);
+      if (already) {
+        actions.push({ coin: c.coin, action: "WAIT", reason: "\u0642\u0628\u0644\u0627\u064B \u062F\u0631 \u062D\u0627\u0644\u062A \u0646\u0645\u0627\u06CC\u0634\u06CC \u062B\u0628\u062A \u0634\u062F\u0647" });
+        continue;
+      }
       actions.push({ coin: c.coin, action: "OPEN(dry)", reason: `\u0627\u0645\u062A\u06CC\u0627\u0632 ${c.score}`, plan: trade });
       st.trades.push({ ...trade, status: "dry" });
       continue;
     }
     try {
+      const { universe } = await getMeta();
+      const ui = universe.find((x) => x.name.toUpperCase() === c.coin.toUpperCase());
+      const dz = ui ? ui.szDecimals : 4;
+      const szRounded = Number(Number(size).toFixed(dz));
+      if (!(szRounded > 0) || szRounded * c.price < 10.2) {
+        actions.push({ coin: c.coin, action: "SKIP", reason: `\u062D\u062C\u0645 ${szRounded} \u0627\u0631\u0632\u0634 $${(szRounded * c.price).toFixed(2)} < \u062D\u062F\u0627\u0642\u0644 $\u06F1\u06F0` });
+        continue;
+      }
       await setLeverage({ coin: c.coin, leverage: CFG.leverage, cross: true });
-      const r = await marketOrder({ coin: c.coin, isBuy: true, size, slippagePct: 1 });
+      const r = await marketOrder({ coin: c.coin, isBuy: true, size: szRounded, slippagePct: 1 });
       const stt = r.response?.data?.statuses?.[0];
       const filled = stt?.filled;
       if (!filled) throw new Error("\u0633\u0641\u0627\u0631\u0634 \u067E\u0631 \u0646\u0634\u062F: " + JSON.stringify(stt));
@@ -33379,6 +33393,41 @@ async function openOrders(coin) {
   const { universe } = await getMeta();
   return oo.filter((o) => o.coin.toUpperCase() === coin.toUpperCase()).map((o) => ({ oid: o.oid, assetIndex: indexOf(universe, o.coin) }));
 }
+async function publicState() {
+  const st = load();
+  let positions = [];
+  let equity = 0;
+  let upnl = 0;
+  try {
+    const acc = await getAccount2();
+    equity = acc.equity;
+    upnl = acc.upnl || 0;
+    const mids = await getMids();
+    positions = acc.positions.map((p) => ({
+      coin: p.coin,
+      size: p.size,
+      entry: p.entry,
+      mid: Number((Object.entries(mids).find(([k]) => k.toUpperCase() === p.coin.toUpperCase()) || [])[1] || p.entry),
+      pnl: p.pnl,
+      leverage: p.leverage,
+      margin: Math.abs(p.value) / (p.leverage || CFG.leverage)
+    }));
+  } catch {
+  }
+  const scores = st.scores || {};
+  const top = Object.entries(scores).map(([coin, score]) => ({ coin, score })).sort((a, b2) => b2.score - a.score).slice(0, 5);
+  const recent = (st.log || []).slice(-1).flatMap((l) => (l.actions || []).slice(0, 6)).reverse();
+  return {
+    cfg: { live: hlConfig().liveConfirm, minScore: CFG.minScore, maxPositions: CFG.maxPositions, notional: CFG.notionalUsd, leverage: CFG.leverage, slPct: CFG.slPct, tpPct: CFG.tpPct },
+    lastScanAt: st.lastScanAt || 0,
+    equity,
+    upnl,
+    positions,
+    top,
+    recent,
+    openTrades: (st.trades || []).filter((t) => t.status === "open").length
+  };
+}
 function botState() {
   const st = load();
   return {
@@ -33390,6 +33439,76 @@ function botState() {
     log: (st.log || []).slice(-5).reverse()
   };
 }
+
+// server/hlPage.js
+var HL_PAGE = [
+  '<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="utf-8">',
+  '<meta name="viewport" content="width=device-width,initial-scale=1">',
+  "<title>\u0648\u0636\u0639\u06CC\u062A \u0631\u0628\u0627\u062A Hyperliquid</title><style>",
+  "*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}",
+  "body{margin:0;padding:14px;background:#0a1120;color:#e8eef8;font-family:system-ui,-apple-system,Segoe UI,Tahoma,sans-serif}",
+  ".w{max-width:540px;margin:0 auto}",
+  ".c{background:linear-gradient(160deg,#0f1c30,#0b1424);border:1px solid #1d2c44;border-radius:16px;padding:15px;margin-bottom:11px}",
+  ".r{display:flex;justify-content:space-between;padding:6px 0;font-size:13.5px}",
+  ".r+.r{border-top:1px solid #16233a}",
+  ".k{color:#7d8ca3}.v{font-variant-numeric:tabular-nums}",
+  ".up{color:#34d399}.down{color:#f0596b}",
+  ".pill{font-size:10.5px;padding:3px 9px;border-radius:20px;border:1px solid #1d2c44;color:#7d8ca3}",
+  ".t{font-size:11.5px;color:#7d8ca3;margin-bottom:8px;letter-spacing:.3px}",
+  "table{width:100%;border-collapse:collapse;font-size:13px}",
+  "td{padding:5px 0;font-variant-numeric:tabular-nums}",
+  ".b{height:6px;background:#16233a;border-radius:4px;overflow:hidden;margin-top:5px}",
+  ".b>i{display:block;height:100%;background:linear-gradient(90deg,#2d7a5f,#34d399)}",
+  ".dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#34d399;margin-left:5px;animation:p 1.5s infinite}",
+  "@keyframes p{0%,100%{opacity:1}50%{opacity:.2}}",
+  ".log{font-size:11.5px;color:#9aabc2;line-height:1.8;font-family:ui-monospace,Menlo,monospace;direction:ltr;text-align:left}",
+  '</style></head><body><div class="w">',
+  '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">',
+  '<div style="font-size:13px;color:#7d8ca3">\u0631\u0628\u0627\u062A Hyperliquid<span class="dot"></span></div>',
+  '<div class="pill" id="clock">\u2026</div></div>',
+  '<div id="app"><div class="c" style="text-align:center;color:#7d8ca3;padding:34px">\u062F\u0631 \u062D\u0627\u0644 \u062E\u0648\u0627\u0646\u062F\u0646\u2026</div></div>',
+  '<div style="text-align:center;font-size:10.5px;color:#4a5872;margin-top:12px">\u0647\u0631 \u06F1\u06F5 \u062B\u0627\u0646\u06CC\u0647 \u0627\u0632 \u0633\u0631\u0648\u0631 \u0628\u0647\u200C\u0631\u0648\u0632 \u0645\u06CC\u200C\u0634\u0648\u062F</div>',
+  "</div><script>",
+  'const fa=function(n){return Number(n).toLocaleString("en-US",{maximumFractionDigits:2})};',
+  'const mo=function(n){return (n<0?"\\u2212$":"$")+fa(Math.abs(n))};',
+  'function when(ts){if(!ts)return "\u2014";const m=Math.round((Date.now()-ts)/60000);',
+  'if(m<1)return "\u0647\u0645\u06CC\u0646 \u062D\u0627\u0644\u0627";if(m<60)return m+" \u062F\u0642\u06CC\u0642\u0647 \u067E\u06CC\u0634";',
+  'const h=Math.floor(m/60);if(h<24)return h+" \u0633\u0627\u0639\u062A \u067E\u06CC\u0634";return Math.floor(h/24)+" \u0631\u0648\u0632 \u067E\u06CC\u0634"}',
+  "function render(d){",
+  'document.getElementById("clock").textContent=new Date().toLocaleTimeString("en-GB");',
+  "const live=d.cfg.live;",
+  'let h="";',
+  // وضعیت
+  `h+='<div class="c"><div class="r" style="border:0"><span class="k">\u062D\u0627\u0644\u062A</span><span class="'+(live?"up":"k")+'">'+(live?"\u0645\u0639\u0627\u0645\u0644\u0647\u0654 \u0648\u0627\u0642\u0639\u06CC":"\u0641\u0642\u0637 \u0646\u0645\u0627\u06CC\u0634\u06CC")+'</span></div>';`,
+  `h+='<div class="r"><span class="k">\u0622\u062E\u0631\u06CC\u0646 \u0627\u0633\u06A9\u0646</span><span class="v">'+when(d.lastScanAt)+'</span></div>';`,
+  `h+='<div class="r"><span class="k">\u0645\u0648\u062C\u0648\u062F\u06CC \u06A9\u0644</span><span class="v">'+mo(d.equity)+'</span></div>';`,
+  `h+='<div class="r"><span class="k">\u0633\u0648\u062F/\u0632\u06CC\u0627\u0646 \u0628\u0627\u0632</span><span class="v '+(d.upnl>=0?"up":"down")+'">'+mo(d.upnl)+'</span></div>';`,
+  `h+='<div class="r"><span class="k">\u067E\u0648\u0632\u06CC\u0634\u0646 \u0628\u0627\u0632</span><span class="v">'+d.positions.length+" \u0627\u0632 "+d.cfg.maxPositions+'</span></div></div>';`,
+  // پوزیشن‌ها
+  "if(d.positions.length){",
+  `h+='<div class="c"><div class="t">\u067E\u0648\u0632\u06CC\u0634\u0646\u200C\u0647\u0627\u06CC \u0628\u0627\u0632</div>';`,
+  "for(const p of d.positions){",
+  `h+='<div style="padding:9px 0;border-top:1px solid #16233a"><div class="r" style="border:0;padding:0"><b>'+p.coin+' <span style="font-size:11px;color:'+(p.size>0?"#5fd0a8":"#f0596b")+'">'+(p.size>0?"\u0644\u0627\u0646\u06AF":"\u0634\u0648\u0631\u062A")+'</span></b><b class="'+(p.pnl>=0?"up":"down")+'">'+mo(p.pnl)+'</b></div>';`,
+  `h+='<div style="font-size:11.5px;color:#7d8ca3;margin-top:3px">\u0648\u0631\u0648\u062F '+fa(p.entry)+" \xB7 \u0641\u0639\u0644\u06CC "+fa(p.mid)+" \xB7 \u0627\u0647\u0631\u0645 "+p.leverage+"\xD7 \xB7 \u0645\u0627\u0631\u062C\u06CC\u0646 "+mo(p.margin)+'</div></div>';`,
+  '}h+="</div>";}',
+  // امتیازها
+  `h+='<div class="c"><div class="t">\u06F5 \u0646\u0645\u0627\u062F \u0628\u0631\u062A\u0631 (\u0622\u0633\u062A\u0627\u0646\u0647 '+d.cfg.minScore+')</div>';`,
+  "const top=d.top||[];const max=Math.max(1,...top.map(function(x){return Math.abs(x.score)}));",
+  "for(const x of top){",
+  "const w=Math.max(2,Math.round(100*Math.abs(x.score)/max));",
+  `h+='<div style="padding:6px 0"><div class="r" style="border:0;padding:0"><span>'+x.coin+'</span><span class="v '+(x.score>=d.cfg.minScore?"up":"k")+'">'+x.score+"</span></div>";`,
+  `h+='<div class="b"><i style="width:'+w+'%;opacity:'+(x.score>=0?1:.35)+'"></i></div></div>';`,
+  '}h+="</div>";',
+  // لاگ
+  "if(d.recent&&d.recent.length){",
+  `h+='<div class="c"><div class="t">\u0622\u062E\u0631\u06CC\u0646 \u0627\u0642\u062F\u0627\u0645\u200C\u0647\u0627</div><div class="log">';`,
+  'for(const a of d.recent)h+=a.coin+" \xB7 "+a.action+" \xB7 "+(a.reason||"")+"<br>";',
+  'h+="</div></div>";}',
+  'document.getElementById("app").innerHTML=h;}',
+  'async function tick(){try{const r=await fetch("/api/hl/public/state");render(await r.json())}catch(e){}}',
+  "tick();setInterval(tick,15000);",
+  "</script></body></html>"
+].join("\n");
 
 // server/walletBot.js
 var COINS = [
@@ -34680,6 +34799,7 @@ function isAuthorized(req, url) {
   if (!APP_PASSWORD) return true;
   if (url.pathname === "/healthz" || url.pathname === "/api/login") return true;
   if (url.pathname === "/api/hl/public") return true;
+  if (url.pathname === "/api/hl/public/state") return true;
   if (!url.pathname.startsWith("/api/")) return true;
   const header = req.headers["x-app-password"];
   if (header && header === APP_PASSWORD) return true;
@@ -34734,6 +34854,13 @@ var server = http2.createServer(async (req, res) => {
         universe: HL_UNIVERSE.length,
         autorun: String(process.env.HL_AUTORUN || "") === "1"
       });
+    }
+    if (req.method === "GET" && pathname === "/api/hl/public/state") {
+      return sendJson(res, 200, await publicState());
+    }
+    if (req.method === "GET" && (pathname === "/hl" || pathname === "/hl/")) {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      return res.end(HL_PAGE);
     }
     if (req.method === "GET" && pathname === "/api/hl/scan") {
       const out = await scan();
