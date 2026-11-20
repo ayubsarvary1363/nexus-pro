@@ -34720,6 +34720,21 @@ var server = http2.createServer(async (req, res) => {
         stateSync: remoteStatus()
       });
     }
+    if (req.method === "GET" && pathname === "/api/hl/public") {
+      const c = hlConfig();
+      return sendJson(res, 200, {
+        ok: true,
+        network: c.network,
+        hasAgentKey: c.hasAgentKey,
+        liveConfirm: c.liveConfirm,
+        account: c.account ? c.account.slice(0, 6) + "\u2026" + c.account.slice(-4) : null,
+        leverage: c.leverage,
+        maxNotionalUsd: c.maxNotionalUsd,
+        maxPositions: c.maxPositions,
+        universe: HL_UNIVERSE.length,
+        autorun: String(process.env.HL_AUTORUN || "") === "1"
+      });
+    }
     if (req.method === "GET" && pathname === "/api/hl/scan") {
       const out = await scan();
       return sendJson(res, 200, { ok: true, ...out });
