@@ -34679,6 +34679,7 @@ var AUTH_COOKIE = "nexus_auth";
 function isAuthorized(req, url) {
   if (!APP_PASSWORD) return true;
   if (url.pathname === "/healthz" || url.pathname === "/api/login") return true;
+  if (url.pathname === "/api/hl/public") return true;
   if (!url.pathname.startsWith("/api/")) return true;
   const header = req.headers["x-app-password"];
   if (header && header === APP_PASSWORD) return true;
