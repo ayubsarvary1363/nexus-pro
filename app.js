@@ -33594,6 +33594,52 @@ async function protectPosition({ coin, isShort, size, entry }, { attempts = 3 } 
   }
   return { ok: done.sl && done.tp, sl: want.sl, tp: want.tp, errors: errs };
 }
+async function closeAllPositions({ reason = "\u0628\u0633\u062A\u0646 \u062F\u0633\u062A\u06CC \u0627\u0632 \u067E\u0646\u0644" } = {}) {
+  const positions = await syncPositions();
+  const out = [];
+  for (const p of positions) {
+    const coin = p.coin;
+    try {
+      const oo = await openOrders(coin).catch(() => []);
+      if (oo.length) {
+        await cancelOrders(oo.map((o) => ({ a: o.assetIndex ?? 0, oid: o.oid }))).catch(() => {
+        });
+        await new Promise((s) => setTimeout(s, 350));
+      }
+      const r = await marketOrder({
+        coin,
+        isBuy: p.size < 0,
+        size: Math.abs(p.size),
+        reduceOnly: true,
+        slippagePct: 1.5
+      });
+      const filled = r?.response?.data?.statuses?.[0]?.filled;
+      out.push({ coin, ok: Boolean(filled), px: filled ? Number(filled.avgPx) : null });
+    } catch (e) {
+      out.push({ coin, ok: false, error: String(e.message || e).slice(0, 120) });
+    }
+    await new Promise((s) => setTimeout(s, 600));
+  }
+  const st = load();
+  st.cooldown = st.cooldown || {};
+  const now = Date.now();
+  for (const o of out) {
+    if (!o.ok) continue;
+    st.cooldown[o.coin.toUpperCase()] = now;
+    const t = (st.trades || []).find((x) => x.status === "open" && x.coin.toUpperCase() === o.coin.toUpperCase());
+    if (t) {
+      t.status = "closed";
+      t.closedAt = now;
+      t.closedBy = "panel";
+    }
+  }
+  st.log = [
+    ...st.log || [],
+    { at: now, dryRun: false, actions: out.map((o) => ({ coin: o.coin, action: o.ok ? "CLOSE_ALL" : "CLOSE_FAIL", reason })) }
+  ].slice(-200);
+  save(st);
+  return { closed: out, cooldownMin: CFG.cooldownMin };
+}
 async function publicState() {
   const st = load();
   let positions = [];
@@ -33671,7 +33717,9 @@ var HL_PAGE = [
   '<div style="font-size:13px;color:#7d8ca3">\u0631\u0628\u0627\u062A Hyperliquid<span class="dot"></span></div>',
   '<div class="pill" id="clock">\u2026</div></div>',
   '<div id="app"><div class="c" style="text-align:center;color:#7d8ca3;padding:34px">\u062F\u0631 \u062D\u0627\u0644 \u062E\u0648\u0627\u0646\u062F\u0646\u2026</div></div>',
-  '<div style="text-align:center;font-size:10.5px;color:#4a5872;margin-top:12px">\u0647\u0631 \u06F1\u06F5 \u062B\u0627\u0646\u06CC\u0647 \u0627\u0632 \u0633\u0631\u0648\u0631 \u0628\u0647\u200C\u0631\u0648\u0632 \u0645\u06CC\u200C\u0634\u0648\u062F</div>',
+  '<button id="btnAll" onclick="closeAll()" style="display:none;width:100%;margin:4px 0 12px;padding:15px;font-size:15px;font-weight:700;color:#fff;background:linear-gradient(160deg,#c0392b,#8e1f1a);border:1px solid #e05a4d;border-radius:14px;font-family:inherit">\u0628\u0633\u062A\u0646 \u0647\u0645\u0647\u0654 \u0645\u0639\u0627\u0645\u0644\u0627\u062A</button>',
+  '<div id="msg" style="display:none;text-align:center;font-size:12px;color:#9aabc2;margin-bottom:10px"></div>',
+  '<div style="text-align:center;font-size:10.5px;color:#4a5872;margin-top:12px">\u0647\u0631 \u06F5 \u062B\u0627\u0646\u06CC\u0647 \u0627\u0632 \u0633\u0631\u0648\u0631 \u0628\u0647\u200C\u0631\u0648\u0632 \u0645\u06CC\u200C\u0634\u0648\u062F</div>',
   "</div><script>",
   'const fa=function(n){return Number(n).toLocaleString("en-US",{maximumFractionDigits:2})};',
   'const mo=function(n){return (n<0?"\\u2212$":"$")+fa(Math.abs(n))};',
@@ -33708,9 +33756,26 @@ var HL_PAGE = [
   `h+='<div class="c"><div class="t">\u0622\u062E\u0631\u06CC\u0646 \u0627\u0642\u062F\u0627\u0645\u200C\u0647\u0627</div><div class="log">';`,
   'for(const a of d.recent)h+=a.coin+" \xB7 "+a.action+" \xB7 "+(a.reason||"")+"<br>";',
   'h+="</div></div>";}',
-  'document.getElementById("app").innerHTML=h;}',
+  'document.getElementById("app").innerHTML=h;',
+  'var bb=document.getElementById("btnAll");bb.style.display=d.positions.length?"block":"none";}',
   'async function tick(){try{const r=await fetch("/api/hl/public/state");render(await r.json())}catch(e){}}',
-  "tick();setInterval(tick,15000);",
+  // ── بستن همه: تأیید دو مرحله‌ای (۴ ثانیه فرصت برای لغو) ──
+  'var armed=0,origTxt="\u0628\u0633\u062A\u0646 \u0647\u0645\u0647\u0654 \u0645\u0639\u0627\u0645\u0644\u0627\u062A";',
+  'function msg(t,c){var m=document.getElementById("msg");m.style.display="block";m.style.color=c||"#9aabc2";m.textContent=t}',
+  'function reset(){var b=document.getElementById("btnAll");armed=0;b.textContent=origTxt;b.style.background="linear-gradient(160deg,#c0392b,#8e1f1a)";b.disabled=false}',
+  'function closeAll(){var b=document.getElementById("btnAll");',
+  'if(!armed){armed=Date.now();b.textContent="\u0645\u0637\u0645\u0626\u0646\u06CC\u061F \u062F\u0648\u0628\u0627\u0631\u0647 \u0628\u0632\u0646";b.style.background="linear-gradient(160deg,#7a1f2b,#4d1310)";',
+  'msg("\u0628\u0631\u0627\u06CC \u0644\u063A\u0648\u060C \u06F4 \u062B\u0627\u0646\u06CC\u0647 \u0647\u06CC\u0686 \u06A9\u0627\u0631\u06CC \u0646\u06A9\u0646");setTimeout(function(){if(armed&&Date.now()-armed>3500)reset()},4200);return}',
+  'armed=0;b.disabled=true;b.textContent="\u062F\u0631 \u062D\u0627\u0644 \u0628\u0633\u062A\u0646\u2026";msg("\u062F\u0631 \u062D\u0627\u0644 \u0627\u0631\u0633\u0627\u0644 \u0628\u0647 \u0635\u0631\u0627\u0641\u06CC\u2026");',
+  'fetch("/api/hl/public/close-all",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({confirm:"CLOSE_ALL_NOW"})})',
+  ".then(function(r){return r.json()}).then(function(d){",
+  'if(!d.ok){msg("\u062E\u0637\u0627: "+(d.error||"\u0646\u0627\u0645\u0634\u062E\u0635"),"#f0596b");b.textContent=origTxt;b.disabled=false;return}',
+  "var done=(d.closed||[]).filter(function(x){return x.ok}),bad=(d.closed||[]).filter(function(x){return !x.ok});",
+  'msg(done.length?(done.length+" \u0645\u0639\u0627\u0645\u0644\u0647 \u0628\u0633\u062A\u0647 \u0634\u062F"+(bad.length?" \xB7 \u0646\u0627\u0645\u0648\u0641\u0642: "+bad.map(function(x){return x.coin}).join(" \u0648 "):"")):"\u0645\u0639\u0627\u0645\u0644\u0647\u200C\u0627\u06CC \u0628\u0631\u0627\u06CC \u0628\u0633\u062A\u0646 \u0646\u0628\u0648\u062F",done.length?"#34d399":"#f0596b");',
+  'b.textContent=origTxt;b.disabled=false;b.style.background="linear-gradient(160deg,#c0392b,#8e1f1a)";',
+  "setTimeout(tick,1200);",
+  '}).catch(function(e){msg("\u062E\u0637\u0627\u06CC \u0634\u0628\u06A9\u0647","#f0596b");b.textContent=origTxt;b.disabled=false})}',
+  "tick();setInterval(tick,5000);",
   "</script></body></html>"
 ].join("\n");
 
@@ -35004,6 +35069,7 @@ function isAuthorized(req, url) {
   if (url.pathname === "/healthz" || url.pathname === "/api/login") return true;
   if (url.pathname === "/api/hl/public") return true;
   if (url.pathname === "/api/hl/public/state") return true;
+  if (url.pathname === "/api/hl/public/close-all") return true;
   if (!url.pathname.startsWith("/api/")) return true;
   const header = req.headers["x-app-password"];
   if (header && header === APP_PASSWORD) return true;
@@ -35011,6 +35077,7 @@ function isAuthorized(req, url) {
   const m = cookie.match(new RegExp(`${AUTH_COOKIE}=([^;]+)`));
   return Boolean(m && decodeURIComponent(m[1]) === APP_PASSWORD);
 }
+var lastCloseAllAt = 0;
 var server = http2.createServer(async (req, res) => {
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
@@ -35061,6 +35128,26 @@ var server = http2.createServer(async (req, res) => {
     }
     if (req.method === "GET" && pathname === "/api/hl/public/state") {
       return sendJson(res, 200, await publicState());
+    }
+    if (req.method === "POST" && pathname === "/api/hl/public/close-all") {
+      const body = await readJsonBody(req);
+      const key = process.env.HL_CLOSE_KEY || "";
+      if (key && String(body?.key || "") !== key) {
+        return sendJson(res, 403, { ok: false, error: "\u06A9\u0644\u06CC\u062F \u0628\u0633\u062A\u0646 \u0627\u0634\u062A\u0628\u0627\u0647 \u0627\u0633\u062A" });
+      }
+      if (String(body?.confirm || "") !== "CLOSE_ALL_NOW") {
+        return sendJson(res, 400, { ok: false, error: "\u062A\u0623\u06CC\u06CC\u062F \u0644\u0627\u0632\u0645 \u0627\u0633\u062A" });
+      }
+      if (!hlConfig().liveConfirm) {
+        return sendJson(res, 400, { ok: false, error: "\u0631\u0628\u0627\u062A \u062F\u0631 \u062D\u0627\u0644\u062A \u0648\u0627\u0642\u0639\u06CC \u0646\u06CC\u0633\u062A" });
+      }
+      const nowMs = Date.now();
+      if (nowMs - lastCloseAllAt < 15e3) {
+        return sendJson(res, 429, { ok: false, error: "\u0647\u0645\u06CC\u0646 \u0686\u0646\u062F \u0644\u062D\u0638\u0647 \u067E\u06CC\u0634 \u0627\u062C\u0631\u0627 \u0634\u062F\u061B \u06F1\u06F5 \u062B\u0627\u0646\u06CC\u0647 \u0635\u0628\u0631 \u06A9\u0646" });
+      }
+      lastCloseAllAt = nowMs;
+      const r = await closeAllPositions({ reason: "\u062F\u06A9\u0645\u0647\u0654 \u0628\u0633\u062A\u0646 \u0647\u0645\u0647" });
+      return sendJson(res, 200, { ok: true, ...r });
     }
     if (req.method === "GET" && (pathname === "/hl" || pathname === "/hl/")) {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
