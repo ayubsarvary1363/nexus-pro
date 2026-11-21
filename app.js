@@ -32891,23 +32891,59 @@ function pack2(v) {
   if (typeof v === "number") {
     if (Number.isInteger(v)) {
       if (v >= 0 && v < 128) return Buffer.from([v]);
-      if (v >= -32 && v < 0) return Buffer.from([256 + v]);
+      if (v >= 0 && v <= 255) {
+        const b3 = Buffer.alloc(2);
+        b3[0] = 204;
+        b3[1] = v;
+        return b3;
+      }
+      if (v >= 0 && v <= 65535) {
+        const b3 = Buffer.alloc(3);
+        b3[0] = 205;
+        b3.writeUInt16BE(v, 1);
+        return b3;
+      }
       if (v >= 0 && v <= 4294967295) {
-        const b4 = Buffer.alloc(5);
-        b4[0] = 206;
-        b4.writeUInt32BE(v, 1);
-        return b4;
+        const b3 = Buffer.alloc(5);
+        b3[0] = 206;
+        b3.writeUInt32BE(v, 1);
+        return b3;
       }
       if (v > 0) {
-        const b4 = Buffer.alloc(9);
-        b4[0] = 207;
-        b4.writeBigUInt64BE(BigInt(v), 1);
-        return b4;
+        const b3 = Buffer.alloc(9);
+        b3[0] = 207;
+        b3.writeBigUInt64BE(BigInt(v), 1);
+        return b3;
       }
-      const b3 = Buffer.alloc(9);
-      b3[0] = 211;
-      b3.writeBigInt64BE(BigInt(v), 1);
-      return b3;
+      if (v >= -32) {
+        const b3 = Buffer.alloc(1);
+        b3[0] = 256 + v;
+        return b3;
+      }
+      if (v >= -128) {
+        const b3 = Buffer.alloc(2);
+        b3[0] = 208;
+        b3.writeInt8(v, 1);
+        return b3;
+      }
+      if (v >= -32768) {
+        const b3 = Buffer.alloc(3);
+        b3[0] = 209;
+        b3.writeInt16BE(v, 1);
+        return b3;
+      }
+      if (v >= -2147483648) {
+        const b3 = Buffer.alloc(5);
+        b3[0] = 210;
+        b3.writeInt32BE(v, 1);
+        return b3;
+      }
+      {
+        const b3 = Buffer.alloc(9);
+        b3[0] = 211;
+        b3.writeBigInt64BE(BigInt(v), 1);
+        return b3;
+      }
     }
     const b2 = Buffer.alloc(9);
     b2[0] = 203;
@@ -33189,15 +33225,22 @@ import fs3 from "node:fs";
 import path3 from "node:path";
 var CFG = {
   minScore: Number(process.env.HL_MIN_SCORE || 60),
-  tf: process.env.HL_TF || "1h",
+  tf: process.env.HL_TF || "1d",
+  // بک‌تست ۷ ماهه: فقط 1d لبهٔ مثبت داشت
   notionalUsd: Number(process.env.HL_MAX_NOTIONAL_USD || 10),
   leverage: Number(process.env.HL_LEVERAGE || 5),
-  slPct: Number(process.env.HL_SL_PCT || 0.65),
-  tpPct: Number(process.env.HL_TP_PCT || 3),
-  maxPositions: Number(process.env.HL_MAX_POSITIONS || 2),
+  slPct: Number(process.env.HL_SL_PCT || 5),
+  tpPct: Number(process.env.HL_TP_PCT || 8),
+  maxPositions: Number(process.env.HL_MAX_POSITIONS || 3),
   maxHoldBars: Number(process.env.HL_MAX_HOLD_BARS || 48),
-  marginCapPct: Number(process.env.HL_MARGIN_CAP_PCT || 60)
+  marginCapPct: Number(process.env.HL_MARGIN_CAP_PCT || 60),
   // حداکثر درصد سرمایه در مارجین
+  // شورت: بک‌تست ۶ ساله — PF 1.25، در هر سال مثبت
+  allowShort: String(process.env.HL_SHORT || "1") !== "0",
+  shortScore: Number(process.env.HL_SHORT_SCORE || 20),
+  // آستانهٔ منفی: امتیاز ≤ −۲۰
+  rsiMax: Number(process.env.HL_RSI_MAX || 45)
+  // شرط RSI برای شورت
 };
 var STATE_FILE2 = process.env.HL_STATE_FILE || path3.join(process.cwd(), "data", "hl-state.json");
 function load() {
@@ -33248,7 +33291,8 @@ async function scan({ symbols = HL_UNIVERSE, bars = 300 } = {}) {
             signal,
             price: key ? Number(mids[key]) : price,
             trendUp: ma50 ? price > ma50 : null,
-            atrPct: a?.summary?.atrPct ?? null
+            atrPct: a?.summary?.atrPct ?? null,
+            rsi: a?.summary?.rsi14 ?? null
           });
         } catch (e) {
           errors.push(`${sym}: ${e.message}`);
@@ -33261,7 +33305,7 @@ async function scan({ symbols = HL_UNIVERSE, bars = 300 } = {}) {
   st.lastScanAt = Date.now();
   st.scores = Object.fromEntries(out.map((r) => [r.coin, r.score]));
   save(st);
-  return { rows: out, errors, scanned: out.length };
+  return { rows: out, errors, scanned: out.length, scores: st.scores, lastScanAt: st.lastScanAt };
 }
 async function syncPositions() {
   const acc = await getAccount2();
@@ -33278,6 +33322,26 @@ async function runCycle({ dryRun = true, scanResult = null } = {}) {
       t.status = "closed";
       t.closedAt = Date.now();
       actions.push({ coin: t.coin, action: "CLOSED", reason: "\u062D\u062F \u0636\u0631\u0631/\u062D\u062F \u0633\u0648\u062F \u0631\u0648\u06CC \u0635\u0631\u0627\u0641\u06CC \u0627\u062C\u0631\u0627 \u0634\u062F" });
+    }
+  }
+  for (const p of positions) {
+    const known = (st.trades || []).find((x) => x.status === "open" && x.coin.toUpperCase() === p.coin.toUpperCase());
+    if (!known) {
+      st.trades.push({
+        coin: p.coin,
+        side: p.size > 0 ? "long" : "short",
+        entry: p.entry,
+        size: Math.abs(p.size),
+        notional: Math.abs(p.value),
+        sl: +(p.entry * (p.size > 0 ? 0.95 : 1.05)).toFixed(6),
+        tp: +(p.entry * (p.size > 0 ? 1.12 : 0.88)).toFixed(6),
+        openedAt: Date.now(),
+        status: "open",
+        adopted: true,
+        live: true,
+        oids: {}
+      });
+      actions.push({ coin: p.coin, action: "ADOPT", reason: "\u067E\u0648\u0632\u06CC\u0634\u0646 \u0645\u0648\u062C\u0648\u062F \u0631\u0648\u06CC \u0635\u0631\u0627\u0641\u06CC \u0628\u0647 \u062F\u0641\u062A\u0631 \u0627\u0636\u0627\u0641\u0647 \u0634\u062F" });
     }
   }
   for (const p of positions) {
@@ -33303,30 +33367,44 @@ async function runCycle({ dryRun = true, scanResult = null } = {}) {
   const scanData = scanResult || await scan();
   const acc = await getAccount2();
   const equity = acc.equity + (acc.positions.length ? 0 : 0);
-  const candidates = (scanData.rows || []).filter(
-    (r) => r.score >= CFG.minScore && !openCoins.has(r.coin.toUpperCase())
-  );
+  const candidates = [];
+  for (const r of scanData.rows || []) {
+    const coin = r.coin.toUpperCase();
+    if (openCoins.has(coin)) continue;
+    if (r.score >= CFG.minScore && r.trendUp === true) {
+      candidates.push({ ...r, side: "long", reason: `\u0627\u0645\u062A\u06CC\u0627\u0632 ${r.score} \xB7 \u0628\u0627\u0644\u0627\u06CC MA50` });
+    } else if (CFG.allowShort && r.score <= -CFG.shortScore && r.trendUp === false && (r.rsi ?? 100) < CFG.rsiMax) {
+      candidates.push({ ...r, side: "short", reason: `\u0627\u0645\u062A\u06CC\u0627\u0632 ${r.score} \xB7 \u0632\u06CC\u0631 MA50 \xB7 RSI ${r.rsi?.toFixed(0)}` });
+    }
+  }
+  candidates.sort((a, b2) => (b2.side === "short" ? Math.abs(b2.score) : b2.score) - (a.side === "short" ? Math.abs(a.score) : a.score));
   for (const c of candidates) {
-    const openCount = positions.length + actions.filter((a) => a.action === "OPEN").length;
+    const openCount = positions.length + actions.filter((a) => a.action === "OPEN" || a.action === "OPEN(dry)").length;
     if (openCount >= CFG.maxPositions) {
       actions.push({ coin: c.coin, action: "SKIP", reason: `\u0633\u0642\u0641 ${CFG.maxPositions} \u067E\u0648\u0632\u06CC\u0634\u0646 \u067E\u0631 \u0627\u0633\u062A` });
       continue;
     }
-    const marginNeeded = CFG.notionalUsd / CFG.leverage;
+    const { universe: uni } = await getMeta();
+    const uinfo = uni.find((x) => x.name.toUpperCase() === c.coin.toUpperCase());
+    const levUse = Math.min(CFG.leverage, uinfo?.maxLeverage || CFG.leverage);
+    const marginNeeded = CFG.notionalUsd / levUse;
     if (marginNeeded > equity * CFG.marginCapPct / 100) {
       actions.push({ coin: c.coin, action: "SKIP", reason: `\u0645\u0627\u0631\u062C\u06CC\u0646 \u0628\u06CC\u0634 \u0627\u0632 ${CFG.marginCapPct}\u066A \u0633\u0631\u0645\u0627\u06CC\u0647` });
       continue;
     }
     const targetNotional = CFG.notionalUsd * 1.02;
     const size = targetNotional / c.price;
+    const isShort = c.side === "short";
     const trade = {
       coin: c.coin,
+      side: c.side,
       score: c.score,
       entry: c.price,
       size,
       notional: CFG.notionalUsd,
-      sl: +(c.price * (1 - CFG.slPct / 100)).toFixed(6),
-      tp: +(c.price * (1 + CFG.tpPct / 100)).toFixed(6),
+      leverage: levUse,
+      sl: +(c.price * (isShort ? 1 + CFG.slPct / 100 : 1 - CFG.slPct / 100)).toFixed(6),
+      tp: +(c.price * (isShort ? 1 - CFG.tpPct / 100 : 1 + CFG.tpPct / 100)).toFixed(6),
       openedAt: Date.now(),
       status: "open",
       live: !dryRun,
@@ -33338,37 +33416,35 @@ async function runCycle({ dryRun = true, scanResult = null } = {}) {
         actions.push({ coin: c.coin, action: "WAIT", reason: "\u0642\u0628\u0644\u0627\u064B \u062F\u0631 \u062D\u0627\u0644\u062A \u0646\u0645\u0627\u06CC\u0634\u06CC \u062B\u0628\u062A \u0634\u062F\u0647" });
         continue;
       }
-      actions.push({ coin: c.coin, action: "OPEN(dry)", reason: `\u0627\u0645\u062A\u06CC\u0627\u0632 ${c.score}`, plan: trade });
+      actions.push({ coin: c.coin, action: "OPEN(dry)", reason: `${c.side === "short" ? "\u0634\u0648\u0631\u062A" : "\u0644\u0627\u0646\u06AF"} \xB7 ${c.reason}`, plan: trade });
       st.trades.push({ ...trade, status: "dry" });
       continue;
     }
     try {
-      const { universe } = await getMeta();
-      const ui = universe.find((x) => x.name.toUpperCase() === c.coin.toUpperCase());
-      const dz = ui ? ui.szDecimals : 4;
+      const dz = uinfo ? uinfo.szDecimals : 4;
       const szRounded = Number(Number(size).toFixed(dz));
       if (!(szRounded > 0) || szRounded * c.price < 10.2) {
         actions.push({ coin: c.coin, action: "SKIP", reason: `\u062D\u062C\u0645 ${szRounded} \u0627\u0631\u0632\u0634 $${(szRounded * c.price).toFixed(2)} < \u062D\u062F\u0627\u0642\u0644 $\u06F1\u06F0` });
         continue;
       }
-      await setLeverage({ coin: c.coin, leverage: CFG.leverage, cross: true });
-      const r = await marketOrder({ coin: c.coin, isBuy: true, size: szRounded, slippagePct: 1 });
+      await setLeverage({ coin: c.coin, leverage: levUse, cross: true });
+      const r = await marketOrder({ coin: c.coin, isBuy: !isShort, size: szRounded, slippagePct: 1 });
       const stt = r.response?.data?.statuses?.[0];
       const filled = stt?.filled;
       if (!filled) throw new Error("\u0633\u0641\u0627\u0631\u0634 \u067E\u0631 \u0646\u0634\u062F: " + JSON.stringify(stt));
       trade.entry = Number(filled.avgPx);
       trade.size = Number(filled.totalSz);
-      trade.sl = +(trade.entry * (1 - CFG.slPct / 100)).toFixed(6);
-      trade.tp = +(trade.entry * (1 + CFG.tpPct / 100)).toFixed(6);
-      const slR = await triggerOrder({ coin: c.coin, isBuy: false, size: trade.size, triggerPx: trade.sl, kind: "sl" });
-      const tpR = await triggerOrder({ coin: c.coin, isBuy: false, size: trade.size, triggerPx: trade.tp, kind: "tp" });
+      trade.sl = +(trade.entry * (isShort ? 1 + CFG.slPct / 100 : 1 - CFG.slPct / 100)).toFixed(6);
+      trade.tp = +(trade.entry * (isShort ? 1 - CFG.tpPct / 100 : 1 + CFG.tpPct / 100)).toFixed(6);
+      const slR = await triggerOrder({ coin: c.coin, isBuy: isShort, size: trade.size, triggerPx: trade.sl, kind: "sl" });
+      const tpR = await triggerOrder({ coin: c.coin, isBuy: isShort, size: trade.size, triggerPx: trade.tp, kind: "tp" });
       trade.oids = { sl: slR.response?.data?.statuses?.[0]?.resting?.oid, tp: tpR.response?.data?.statuses?.[0]?.resting?.oid };
       trade.status = "open";
       st.trades.push(trade);
       actions.push({
         coin: c.coin,
         action: "OPEN",
-        reason: `\u0627\u0645\u062A\u06CC\u0627\u0632 ${c.score}`,
+        reason: `${c.side} \xB7 ${c.reason}`,
         entry: trade.entry,
         size: trade.size,
         sl: trade.sl,
@@ -33380,6 +33456,11 @@ async function runCycle({ dryRun = true, scanResult = null } = {}) {
       actions.push({ coin: c.coin, action: "ERROR", reason: e.message });
     }
   }
+  if (scanData && scanData.rows) {
+    st.lastScanAt = scanData.lastScanAt || Date.now();
+    st.scores = Object.fromEntries(scanData.rows.map((r) => [r.coin, r.score]));
+  }
+  st.lastCycleAt = Date.now();
   st.log = [...st.log || [], { at: Date.now(), dryRun, actions }].slice(-200);
   save(st);
   return { actions, errors, positions, equity, candidates: candidates.map((c) => ({ coin: c.coin, score: c.score })) };
@@ -33410,7 +33491,8 @@ async function publicState() {
       mid: Number((Object.entries(mids).find(([k]) => k.toUpperCase() === p.coin.toUpperCase()) || [])[1] || p.entry),
       pnl: p.pnl,
       leverage: p.leverage,
-      margin: Math.abs(p.value) / (p.leverage || CFG.leverage)
+      margin: Math.abs(p.value) / (p.leverage || CFG.leverage),
+      side: p.size > 0 ? "long" : "short"
     }));
   } catch {
   }
@@ -33420,6 +33502,8 @@ async function publicState() {
   return {
     cfg: { live: hlConfig().liveConfirm, minScore: CFG.minScore, maxPositions: CFG.maxPositions, notional: CFG.notionalUsd, leverage: CFG.leverage, slPct: CFG.slPct, tpPct: CFG.tpPct },
     lastScanAt: st.lastScanAt || 0,
+    lastCycleAt: st.lastCycleAt || 0,
+    autorun: String(process.env.HL_AUTORUN || "") === "1",
     equity,
     upnl,
     positions,
