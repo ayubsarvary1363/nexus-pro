@@ -33363,12 +33363,37 @@ async function runCycle({ dryRun = true, scanResult = null } = {}) {
   const positions = await syncPositions();
   const openCoins = new Set(positions.map((p) => p.coin.toUpperCase()));
   st.cooldown = st.cooldown || {};
+  let fillsCache = null;
+  const closePnlOf = async (coin, since) => {
+    if (!fillsCache) {
+      fillsCache = await fetch(hlConfig().api + "/info", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ type: "userFills", user: process.env.HL_ACCOUNT })
+      }).then((r) => r.json()).then((j) => Array.isArray(j) ? j : j.fills || []).catch(() => []);
+    }
+    return fillsCache.filter((f2) => String(f2.coin).toUpperCase() === coin.toUpperCase() && /close/i.test(f2.dir || "") && f2.time >= (since || 0)).reduce((a, f2) => a + Number(f2.closedPnl || 0), 0);
+  };
   for (const t of st.trades.filter((x) => x.status === "open")) {
     if (!openCoins.has(t.coin.toUpperCase())) {
       t.status = "closed";
       t.closedAt = Date.now();
-      st.cooldown[t.coin.toUpperCase()] = Date.now();
-      actions.push({ coin: t.coin, action: "CLOSED", reason: "\u062D\u062F \u0636\u0631\u0631/\u062D\u062F \u0633\u0648\u062F \u0631\u0648\u06CC \u0635\u0631\u0627\u0641\u06CC \u0627\u062C\u0631\u0627 \u0634\u062F" });
+      const pnl = await closePnlOf(t.coin, t.openedAt);
+      t.pnl = +pnl.toFixed(4);
+      if (pnl < 0) {
+        st.cooldown[t.coin.toUpperCase()] = Date.now();
+        actions.push({
+          coin: t.coin,
+          action: "CLOSED",
+          reason: `\u0628\u0633\u062A\u0647 \u0634\u062F (${pnl >= 0 ? "+" : "\u2212"}$${Math.abs(pnl).toFixed(2)}) \xB7 ${CFG.cooldownMin} \u062F\u0642\u06CC\u0642\u0647 \u0642\u0641\u0644`
+        });
+      } else {
+        actions.push({
+          coin: t.coin,
+          action: "CLOSED",
+          reason: `\u0628\u0633\u062A\u0647 \u0634\u062F (+$${pnl.toFixed(2)}) \xB7 \u0633\u0648\u062F\u062F\u0647\u060C \u0628\u062F\u0648\u0646 \u0642\u0641\u0644`
+        });
+      }
     }
   }
   for (const p of positions) {
@@ -33614,7 +33639,12 @@ async function closeAllPositions({ reason = "\u0628\u0633\u062A\u0646 \u062F\u06
         slippagePct: 1.5
       });
       const filled = r?.response?.data?.statuses?.[0]?.filled;
-      out.push({ coin, ok: Boolean(filled), px: filled ? Number(filled.avgPx) : null });
+      let pnl = null;
+      if (filled) {
+        const avg = Number(filled.avgPx);
+        pnl = +(p.size < 0 ? (p.entry - avg) * Math.abs(p.size) : (avg - p.entry) * Math.abs(p.size)).toFixed(4);
+      }
+      out.push({ coin, ok: Boolean(filled), px: filled ? Number(filled.avgPx) : null, pnl });
     } catch (e) {
       out.push({ coin, ok: false, error: String(e.message || e).slice(0, 120) });
     }
@@ -33625,17 +33655,29 @@ async function closeAllPositions({ reason = "\u0628\u0633\u062A\u0646 \u062F\u06
   const now = Date.now();
   for (const o of out) {
     if (!o.ok) continue;
-    st.cooldown[o.coin.toUpperCase()] = now;
+    const profitable = (o.pnl ?? 0) >= 0;
+    o.locked = !profitable;
+    if (profitable) delete st.cooldown[o.coin.toUpperCase()];
+    else st.cooldown[o.coin.toUpperCase()] = now;
     const t = (st.trades || []).find((x) => x.status === "open" && x.coin.toUpperCase() === o.coin.toUpperCase());
     if (t) {
       t.status = "closed";
       t.closedAt = now;
       t.closedBy = "panel";
+      t.pnl = o.pnl;
     }
   }
   st.log = [
     ...st.log || [],
-    { at: now, dryRun: false, actions: out.map((o) => ({ coin: o.coin, action: o.ok ? "CLOSE_ALL" : "CLOSE_FAIL", reason })) }
+    {
+      at: now,
+      dryRun: false,
+      actions: out.map((o) => ({
+        coin: o.coin,
+        action: o.ok ? "CLOSE_ALL" : "CLOSE_FAIL",
+        reason: o.ok ? `${reason} \xB7 ${o.pnl >= 0 ? "+" : "\u2212"}$${Math.abs(o.pnl ?? 0).toFixed(2)} \xB7 ${o.locked ? "\u0642\u0641\u0644 \u0634\u062F" : "\u0628\u062F\u0648\u0646 \u0642\u0641\u0644 (\u0633\u0648\u062F\u062F\u0647)"}` : `${reason} \xB7 ${o.error || "\u0646\u0627\u0645\u0648\u0641\u0642"}`
+      }))
+    }
   ].slice(-200);
   save(st);
   return { closed: out, cooldownMin: CFG.cooldownMin };
@@ -33716,9 +33758,9 @@ var HL_PAGE = [
   '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">',
   '<div style="font-size:13px;color:#7d8ca3">\u0631\u0628\u0627\u062A Hyperliquid<span class="dot"></span></div>',
   '<div class="pill" id="clock">\u2026</div></div>',
-  '<div id="app"><div class="c" style="text-align:center;color:#7d8ca3;padding:34px">\u062F\u0631 \u062D\u0627\u0644 \u062E\u0648\u0627\u0646\u062F\u0646\u2026</div></div>',
-  '<button id="btnAll" onclick="closeAll()" style="display:none;width:100%;margin:4px 0 12px;padding:15px;font-size:15px;font-weight:700;color:#fff;background:linear-gradient(160deg,#c0392b,#8e1f1a);border:1px solid #e05a4d;border-radius:14px;font-family:inherit">\u0628\u0633\u062A\u0646 \u0647\u0645\u0647\u0654 \u0645\u0639\u0627\u0645\u0644\u0627\u062A</button>',
+  '<button id="btnAll" onclick="closeAll()" style="display:none;width:100%;margin:0 0 11px;padding:15px;font-size:15px;font-weight:700;color:#fff;background:linear-gradient(160deg,#c0392b,#8e1f1a);border:1px solid #e05a4d;border-radius:14px;font-family:inherit">\u0628\u0633\u062A\u0646 \u0647\u0645\u0647\u0654 \u0645\u0639\u0627\u0645\u0644\u0627\u062A</button>',
   '<div id="msg" style="display:none;text-align:center;font-size:12px;color:#9aabc2;margin-bottom:10px"></div>',
+  '<div id="app"><div class="c" style="text-align:center;color:#7d8ca3;padding:34px">\u062F\u0631 \u062D\u0627\u0644 \u062E\u0648\u0627\u0646\u062F\u0646\u2026</div></div>',
   '<div style="text-align:center;font-size:10.5px;color:#4a5872;margin-top:12px">\u0647\u0631 \u06F5 \u062B\u0627\u0646\u06CC\u0647 \u0627\u0632 \u0633\u0631\u0648\u0631 \u0628\u0647\u200C\u0631\u0648\u0632 \u0645\u06CC\u200C\u0634\u0648\u062F</div>',
   "</div><script>",
   'const fa=function(n){return Number(n).toLocaleString("en-US",{maximumFractionDigits:2})};',
@@ -33771,7 +33813,9 @@ var HL_PAGE = [
   ".then(function(r){return r.json()}).then(function(d){",
   'if(!d.ok){msg("\u062E\u0637\u0627: "+(d.error||"\u0646\u0627\u0645\u0634\u062E\u0635"),"#f0596b");b.textContent=origTxt;b.disabled=false;return}',
   "var done=(d.closed||[]).filter(function(x){return x.ok}),bad=(d.closed||[]).filter(function(x){return !x.ok});",
-  'msg(done.length?(done.length+" \u0645\u0639\u0627\u0645\u0644\u0647 \u0628\u0633\u062A\u0647 \u0634\u062F"+(bad.length?" \xB7 \u0646\u0627\u0645\u0648\u0641\u0642: "+bad.map(function(x){return x.coin}).join(" \u0648 "):"")):"\u0645\u0639\u0627\u0645\u0644\u0647\u200C\u0627\u06CC \u0628\u0631\u0627\u06CC \u0628\u0633\u062A\u0646 \u0646\u0628\u0648\u062F",done.length?"#34d399":"#f0596b");',
+  "var lk=done.filter(function(x){return x.locked}).map(function(x){return x.coin}),fr=done.filter(function(x){return !x.locked}).map(function(x){return x.coin});",
+  'var tx=done.length?(done.length+" \u0645\u0639\u0627\u0645\u0644\u0647 \u0628\u0633\u062A\u0647 \u0634\u062F")+(lk.length?" \xB7 \u0642\u0641\u0644: "+lk.join("\u060C "):"")+(fr.length?" \xB7 \u0628\u062F\u0648\u0646 \u0642\u0641\u0644: "+fr.join("\u060C "):"")+(bad.length?" \xB7 \u0646\u0627\u0645\u0648\u0641\u0642: "+bad.map(function(x){return x.coin}).join("\u060C "):""):"\u0645\u0639\u0627\u0645\u0644\u0647\u200C\u0627\u06CC \u0628\u0631\u0627\u06CC \u0628\u0633\u062A\u0646 \u0646\u0628\u0648\u062F";',
+  'msg(tx,done.length?"#34d399":"#f0596b");',
   'b.textContent=origTxt;b.disabled=false;b.style.background="linear-gradient(160deg,#c0392b,#8e1f1a)";',
   "setTimeout(tick,1200);",
   '}).catch(function(e){msg("\u062E\u0637\u0627\u06CC \u0634\u0628\u06A9\u0647","#f0596b");b.textContent=origTxt;b.disabled=false})}',
