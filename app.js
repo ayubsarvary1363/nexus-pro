@@ -33107,8 +33107,10 @@ async function getAccount2() {
   const perpsValue = Number(s.marginSummary?.accountValue || 0);
   return {
     account: ACCOUNT,
-    // حساب یکپارچه: پول در اسپات می‌ماند و به‌عنوان مارجین استفاده می‌شود
-    equity: Math.max(perpsValue, spotUsdc + upnlSum),
+    // accountValue صرافی همان عددی است که سایت Hyperliquid نشان می‌دهد و سود/زیان باز را
+    // از قبل در خود دارد. اسپات USDC هم همان پول است (حساب یکپارچه)، پس نباید دوباره
+    // با upnl جمع شود — قبلاً همین اشتباه، موجودی را به اندازهٔ سود باز بیشتر نشان می‌داد.
+    equity: perpsValue > 0 ? perpsValue : spotUsdc,
     perpsValue,
     spotUsdc,
     upnl: upnlSum,
@@ -33620,7 +33622,17 @@ async function protectPosition({ coin, isShort, size, entry }, { attempts = 3 } 
   return { ok: done.sl && done.tp, sl: want.sl, tp: want.tp, errors: errs };
 }
 async function closeAllPositions({ reason = "\u0628\u0633\u062A\u0646 \u062F\u0633\u062A\u06CC \u0627\u0632 \u067E\u0646\u0644" } = {}) {
-  const positions = await syncPositions();
+  return closeMany(null, reason);
+}
+async function closeOnePosition(coin, { reason = "\u0628\u0633\u062A\u0646 \u06CC\u06A9 \u067E\u0648\u0632\u06CC\u0634\u0646 \u0627\u0632 \u067E\u0646\u0644" } = {}) {
+  const want = String(coin || "").toUpperCase();
+  const r = await closeMany([want], reason);
+  if (!r.closed.length) r.notFound = true;
+  return r;
+}
+async function closeMany(coins, reason) {
+  const all = await syncPositions();
+  const positions = coins ? all.filter((p) => coins.includes(String(p.coin).toUpperCase())) : all;
   const out = [];
   for (const p of positions) {
     const coin = p.coin;
@@ -33687,10 +33699,14 @@ async function publicState() {
   let positions = [];
   let equity = 0;
   let upnl = 0;
+  let marginUsed = 0;
+  let freeMargin = 0;
   try {
     const acc = await getAccount2();
     equity = acc.equity;
     upnl = acc.upnl || 0;
+    marginUsed = acc.marginUsed || 0;
+    freeMargin = acc.withdrawable || 0;
     const mids = await getMids();
     positions = acc.positions.map((p) => ({
       coin: p.coin,
@@ -33714,6 +33730,8 @@ async function publicState() {
     autorun: String(process.env.HL_AUTORUN || "") === "1",
     equity,
     upnl,
+    marginUsed,
+    freeMargin,
     positions,
     top,
     recent,
@@ -33768,6 +33786,7 @@ var HL_PAGE = [
   'function when(ts){if(!ts)return "\u2014";const m=Math.round((Date.now()-ts)/60000);',
   'if(m<1)return "\u0647\u0645\u06CC\u0646 \u062D\u0627\u0644\u0627";if(m<60)return m+" \u062F\u0642\u06CC\u0642\u0647 \u067E\u06CC\u0634";',
   'const h=Math.floor(m/60);if(h<24)return h+" \u0633\u0627\u0639\u062A \u067E\u06CC\u0634";return Math.floor(h/24)+" \u0631\u0648\u0632 \u067E\u06CC\u0634"}',
+  "var armedCoins={};",
   "function render(d){",
   'document.getElementById("clock").textContent=new Date().toLocaleTimeString("en-GB");',
   "const live=d.cfg.live;",
@@ -33777,13 +33796,18 @@ var HL_PAGE = [
   `h+='<div class="r"><span class="k">\u0622\u062E\u0631\u06CC\u0646 \u0627\u0633\u06A9\u0646</span><span class="v">'+when(d.lastScanAt)+'</span></div>';`,
   `h+='<div class="r"><span class="k">\u0645\u0648\u062C\u0648\u062F\u06CC \u06A9\u0644</span><span class="v">'+mo(d.equity)+'</span></div>';`,
   `h+='<div class="r"><span class="k">\u0633\u0648\u062F/\u0632\u06CC\u0627\u0646 \u0628\u0627\u0632</span><span class="v '+(d.upnl>=0?"up":"down")+'">'+mo(d.upnl)+'</span></div>';`,
+  `h+='<div class="r"><span class="k">\u062F\u0631 \u0645\u0627\u0631\u062C\u06CC\u0646</span><span class="v">'+mo(d.marginUsed||0)+'</span></div>';`,
+  `h+='<div class="r"><span class="k">\u0622\u0632\u0627\u062F (\u0642\u0627\u0628\u0644 \u0628\u0631\u062F\u0627\u0634\u062A)</span><span class="v">'+mo(d.freeMargin||0)+'</span></div>';`,
   `h+='<div class="r"><span class="k">\u067E\u0648\u0632\u06CC\u0634\u0646 \u0628\u0627\u0632</span><span class="v">'+d.positions.length+" \u0627\u0632 "+d.cfg.maxPositions+'</span></div></div>';`,
   // پوزیشن‌ها
   "if(d.positions.length){",
   `h+='<div class="c"><div class="t">\u067E\u0648\u0632\u06CC\u0634\u0646\u200C\u0647\u0627\u06CC \u0628\u0627\u0632</div>';`,
   "for(const p of d.positions){",
   `h+='<div style="padding:9px 0;border-top:1px solid #16233a"><div class="r" style="border:0;padding:0"><b>'+p.coin+' <span style="font-size:11px;color:'+(p.size>0?"#5fd0a8":"#f0596b")+'">'+(p.size>0?"\u0644\u0627\u0646\u06AF":"\u0634\u0648\u0631\u062A")+'</span></b><b class="'+(p.pnl>=0?"up":"down")+'">'+mo(p.pnl)+'</b></div>';`,
-  `h+='<div style="font-size:11.5px;color:#7d8ca3;margin-top:3px">\u0648\u0631\u0648\u062F '+fa(p.entry)+" \xB7 \u0641\u0639\u0644\u06CC "+fa(p.mid)+" \xB7 \u0627\u0647\u0631\u0645 "+p.leverage+"\xD7 \xB7 \u0645\u0627\u0631\u062C\u06CC\u0646 "+mo(p.margin)+'</div></div>';`,
+  `h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px"><span style="font-size:11.5px;color:#7d8ca3">\u0648\u0631\u0648\u062F '+fa(p.entry)+" \xB7 \u0641\u0639\u0644\u06CC "+fa(p.mid)+" \xB7 \u0627\u0647\u0631\u0645 "+p.leverage+"\xD7"+'</span>';`,
+  "var armNow=armedCoins[p.coin]&&Date.now()-armedCoins[p.coin]<4000;",
+  `h+='<button id="cb-'+p.coin+'" onclick="closeOne(\\''+p.coin+'\\')" style="padding:7px 14px;font-size:12px;font-weight:700;border-radius:10px;font-family:inherit;background:'+(armNow?"#7a1f2b":"transparent")+';color:'+(armNow?"#fff":"#f0596b")+';border:1px solid '+(armNow?"#e05a4d":"#5c2b30")+'">'+(armNow?"\u0645\u0637\u0645\u0626\u0646\u06CC\u061F":"\u0628\u0633\u062A\u0646")+'</button></div>';`,
+  `h+='<div style="font-size:11px;color:#5f6d84;margin-top:2px">\u0645\u0627\u0631\u062C\u06CC\u0646 '+mo(p.margin)+'</div>';`,
   '}h+="</div>";}',
   // امتیازها
   `h+='<div class="c"><div class="t">\u06F5 \u0646\u0645\u0627\u062F \u0628\u0631\u062A\u0631 (\u0622\u0633\u062A\u0627\u0646\u0647 '+d.cfg.minScore+')</div>';`,
@@ -33819,6 +33843,18 @@ var HL_PAGE = [
   'b.textContent=origTxt;b.disabled=false;b.style.background="linear-gradient(160deg,#c0392b,#8e1f1a)";',
   "setTimeout(tick,1200);",
   '}).catch(function(e){msg("\u062E\u0637\u0627\u06CC \u0634\u0628\u06A9\u0647","#f0596b");b.textContent=origTxt;b.disabled=false})}',
+  // ── بستن یک پوزیشن: تأیید دو مرحله‌ای ──
+  'function closeOne(coin){var b=document.getElementById("cb-"+coin);if(!b)return;',
+  'if(!armedCoins[coin]){armedCoins[coin]=Date.now();b.textContent="\u0645\u0637\u0645\u0626\u0646\u06CC\u061F";b.style.background="#7a1f2b";b.style.color="#fff";b.style.borderColor="#e05a4d";',
+  'setTimeout(function(){if(armedCoins[coin]&&Date.now()-armedCoins[coin]>3500){armedCoins[coin]=0;b.textContent="\u0628\u0633\u062A\u0646";b.style.background="transparent";b.style.color="#f0596b";b.style.borderColor="#5c2b30"}},4200);return}',
+  'armedCoins[coin]=0;b.disabled=true;b.textContent="\u2026";msg("\u062F\u0631 \u062D\u0627\u0644 \u0628\u0633\u062A\u0646 "+coin+"\u2026");',
+  'fetch("/api/hl/public/close-one",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({coin:coin,confirm:"CLOSE_ONE"})})',
+  ".then(function(r){return r.json()}).then(function(d){",
+  'if(!d.ok){msg("\u062E\u0637\u0627: "+(d.error||"\u0646\u0627\u0645\u0634\u062E\u0635"),"#f0596b");b.textContent="\u0628\u0633\u062A\u0646";b.disabled=false;return}',
+  "var x=(d.closed||[])[0]||{};",
+  'var t=coin+" \u0628\u0633\u062A\u0647 \u0634\u062F"+(x.pnl!=null?(" \xB7 "+(x.pnl>=0?"+":"\\u2212")+"$"+Math.abs(x.pnl).toFixed(2)):"")+(x.locked?" \xB7 \u0642\u0641\u0644 \u0634\u062F":" \xB7 \u0628\u062F\u0648\u0646 \u0642\u0641\u0644");',
+  'msg(t,x.ok?"#34d399":"#f0596b");setTimeout(tick,1200);',
+  '}).catch(function(){msg("\u062E\u0637\u0627\u06CC \u0634\u0628\u06A9\u0647","#f0596b");b.textContent="\u0628\u0633\u062A\u0646";b.disabled=false})}',
   "tick();setInterval(tick,5000);",
   "</script></body></html>"
 ].join("\n");
@@ -35114,6 +35150,7 @@ function isAuthorized(req, url) {
   if (url.pathname === "/api/hl/public") return true;
   if (url.pathname === "/api/hl/public/state") return true;
   if (url.pathname === "/api/hl/public/close-all") return true;
+  if (url.pathname === "/api/hl/public/close-one") return true;
   if (!url.pathname.startsWith("/api/")) return true;
   const header = req.headers["x-app-password"];
   if (header && header === APP_PASSWORD) return true;
@@ -35122,6 +35159,7 @@ function isAuthorized(req, url) {
   return Boolean(m && decodeURIComponent(m[1]) === APP_PASSWORD);
 }
 var lastCloseAllAt = 0;
+var lastCloseOneAt = 0;
 var server = http2.createServer(async (req, res) => {
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
@@ -35191,6 +35229,31 @@ var server = http2.createServer(async (req, res) => {
       }
       lastCloseAllAt = nowMs;
       const r = await closeAllPositions({ reason: "\u062F\u06A9\u0645\u0647\u0654 \u0628\u0633\u062A\u0646 \u0647\u0645\u0647" });
+      return sendJson(res, 200, { ok: true, ...r });
+    }
+    if (req.method === "POST" && pathname === "/api/hl/public/close-one") {
+      const body = await readJsonBody(req);
+      const key = process.env.HL_CLOSE_KEY || "";
+      if (key && String(body?.key || "") !== key) {
+        return sendJson(res, 403, { ok: false, error: "\u06A9\u0644\u06CC\u062F \u0628\u0633\u062A\u0646 \u0627\u0634\u062A\u0628\u0627\u0647 \u0627\u0633\u062A" });
+      }
+      if (String(body?.confirm || "") !== "CLOSE_ONE") {
+        return sendJson(res, 400, { ok: false, error: "\u062A\u0623\u06CC\u06CC\u062F \u0644\u0627\u0632\u0645 \u0627\u0633\u062A" });
+      }
+      const coin = String(body?.coin || "").toUpperCase();
+      if (!/^[A-Z0-9]{1,12}$/.test(coin)) {
+        return sendJson(res, 400, { ok: false, error: "\u0646\u0627\u0645 \u0633\u06A9\u0647 \u0646\u0627\u0645\u0639\u062A\u0628\u0631 \u0627\u0633\u062A" });
+      }
+      if (!hlConfig().liveConfirm) {
+        return sendJson(res, 400, { ok: false, error: "\u0631\u0628\u0627\u062A \u062F\u0631 \u062D\u0627\u0644\u062A \u0648\u0627\u0642\u0639\u06CC \u0646\u06CC\u0633\u062A" });
+      }
+      const nowMs = Date.now();
+      if (nowMs - lastCloseOneAt < 3e3) {
+        return sendJson(res, 429, { ok: false, error: "\u06A9\u0645\u06CC \u0635\u0628\u0631 \u06A9\u0646" });
+      }
+      lastCloseOneAt = nowMs;
+      const r = await closeOnePosition(coin, { reason: `\u0628\u0633\u062A\u0646 ${coin} \u0627\u0632 \u067E\u0646\u0644` });
+      if (r.notFound) return sendJson(res, 404, { ok: false, error: `\u067E\u0648\u0632\u06CC\u0634\u0646\u06CC \u0628\u0631\u0627\u06CC ${coin} \u0628\u0627\u0632 \u0646\u06CC\u0633\u062A` });
       return sendJson(res, 200, { ok: true, ...r });
     }
     if (req.method === "GET" && (pathname === "/hl" || pathname === "/hl/")) {
