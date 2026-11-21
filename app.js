@@ -33135,17 +33135,57 @@ async function exchange(action, { dryRun = false } = {}) {
   if (!PRIVATE_KEY) {
     return { dryRun: true, payload: { action, nonce, signature: null, note: "HL_AGENT_KEY \u0633\u062A \u0646\u0634\u062F\u0647" } };
   }
-  const payload = { action, nonce, signature: sign(action, nonce), vaultAddress: null };
-  if (dryRun) return { dryRun: true, payload };
-  const r = await fetch(API + "/exchange", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(2e4)
-  });
-  const j = await r.json();
-  if (j.status !== "ok") throw new Error("HL: " + (j.response || JSON.stringify(j)).slice(0, 160));
-  return j;
+  if (dryRun) {
+    const payload = { action, nonce, signature: sign(action, nonce), vaultAddress: null };
+    return { dryRun: true, payload };
+  }
+  let lastErr = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const n2 = Date.now() + attempt;
+    const payload = { action, nonce: n2, signature: sign(action, n2), vaultAddress: null };
+    let j = null;
+    try {
+      const r = await fetch(API + "/exchange", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(2e4)
+      });
+      if (r.status === 429) {
+        lastErr = new Error("HL: 429 Too Many Requests");
+        await new Promise((s) => setTimeout(s, 1200 * (attempt + 1)));
+        continue;
+      }
+      j = await r.json();
+    } catch (e) {
+      lastErr = e;
+      await new Promise((s) => setTimeout(s, 800 * (attempt + 1)));
+      continue;
+    }
+    if (j.status !== "ok") {
+      const msg = String(j.response || JSON.stringify(j)).slice(0, 160);
+      lastErr = new Error("HL: " + msg);
+      if (/too many|rate/i.test(msg)) {
+        await new Promise((s) => setTimeout(s, 1200 * (attempt + 1)));
+        continue;
+      }
+      throw lastErr;
+    }
+    const sts = j?.response?.data?.statuses;
+    if (Array.isArray(sts)) {
+      const err = sts.map((s) => s && typeof s === "object" ? s.error : null).find(Boolean);
+      if (err) {
+        lastErr = new Error("HL: " + String(err).slice(0, 160));
+        if (/too many|rate/i.test(String(err))) {
+          await new Promise((s) => setTimeout(s, 1200 * (attempt + 1)));
+          continue;
+        }
+        throw lastErr;
+      }
+    }
+    return j;
+  }
+  throw lastErr || new Error("HL: \u062F\u0631\u062E\u0648\u0627\u0633\u062A \u0646\u0627\u0645\u0648\u0641\u0642");
 }
 function roundPrice(px, szDecimals) {
   const maxDec = Math.max(0, 6 - Number(szDecimals ?? 4));
@@ -33179,16 +33219,19 @@ async function triggerOrder({ coin, isBuy, size, triggerPx, kind = "sl", dryRun 
   const { universe } = await getMeta();
   const idx = indexOf(universe, coin);
   if (idx < 0) throw new Error(`${coin} \u0631\u0648\u06CC Hyperliquid \u0646\u06CC\u0633\u062A`);
+  const u = universe[idx] || {};
+  const pxStr = roundPrice(triggerPx, u.szDecimals);
+  const szStr = roundSize(size, u.szDecimals);
   const action = {
     type: "order",
     orders: [
       {
         a: idx,
         b: isBuy,
-        p: roundPrice(triggerPx, 4),
-        s: roundSize(size, 4),
+        p: pxStr,
+        s: szStr,
         r: true,
-        t: { trigger: { isMarket: true, triggerPx: roundPrice(triggerPx, 4), tpsl: kind } }
+        t: { trigger: { isMarket: true, triggerPx: pxStr, tpsl: kind } }
       }
     ],
     grouping: "na"
@@ -33235,6 +33278,8 @@ var CFG = {
   maxHoldBars: Number(process.env.HL_MAX_HOLD_BARS || 48),
   marginCapPct: Number(process.env.HL_MARGIN_CAP_PCT || 60),
   // حداکثر درصد سرمایه در مارجین
+  // بعد از بسته شدن یک معامله، تا این مدت دوباره وارد همان سکه نشو (ثانیه‌ای که استاپ خورد و ۱۱ دقیقه بعد دوباره وارد شد)
+  cooldownMin: Number(process.env.HL_SL_COOLDOWN_MIN || 120),
   // شورت: بک‌تست ۶ ساله — PF 1.25، در هر سال مثبت
   allowShort: String(process.env.HL_SHORT || "1") !== "0",
   shortScore: Number(process.env.HL_SHORT_SCORE || 20),
@@ -33317,10 +33362,12 @@ async function runCycle({ dryRun = true, scanResult = null } = {}) {
   const errors = [];
   const positions = await syncPositions();
   const openCoins = new Set(positions.map((p) => p.coin.toUpperCase()));
+  st.cooldown = st.cooldown || {};
   for (const t of st.trades.filter((x) => x.status === "open")) {
     if (!openCoins.has(t.coin.toUpperCase())) {
       t.status = "closed";
       t.closedAt = Date.now();
+      st.cooldown[t.coin.toUpperCase()] = Date.now();
       actions.push({ coin: t.coin, action: "CLOSED", reason: "\u062D\u062F \u0636\u0631\u0631/\u062D\u062F \u0633\u0648\u062F \u0631\u0648\u06CC \u0635\u0631\u0627\u0641\u06CC \u0627\u062C\u0631\u0627 \u0634\u062F" });
     }
   }
@@ -33342,6 +33389,25 @@ async function runCycle({ dryRun = true, scanResult = null } = {}) {
         oids: {}
       });
       actions.push({ coin: p.coin, action: "ADOPT", reason: "\u067E\u0648\u0632\u06CC\u0634\u0646 \u0645\u0648\u062C\u0648\u062F \u0631\u0648\u06CC \u0635\u0631\u0627\u0641\u06CC \u0628\u0647 \u062F\u0641\u062A\u0631 \u0627\u0636\u0627\u0641\u0647 \u0634\u062F" });
+    }
+  }
+  if (!dryRun && positions.length) {
+    const orders = await allOpenOrders().catch(() => []);
+    for (const p of positions) {
+      const have = protectionOf(orders, p.coin);
+      if (have.sl && have.tp) continue;
+      const r = await protectPosition({
+        coin: p.coin,
+        isShort: p.size < 0,
+        size: Math.abs(p.size),
+        entry: p.entry
+      });
+      actions.push({
+        coin: p.coin,
+        action: r.ok ? "PROTECT" : "PROTECT_FAIL",
+        reason: r.ok ? `\u0645\u062D\u0627\u0641\u0638 \u062A\u06A9\u0645\u06CC\u0644 \u0634\u062F (\u0627\u0633\u062A\u0627\u067E ${r.sl} \xB7 \u0647\u062F\u0641 ${r.tp})` : `\u0645\u062D\u0627\u0641\u0638 \u062B\u0628\u062A \u0646\u0634\u062F: ${r.errors.slice(-1)[0] || "\u0646\u0627\u0645\u0634\u062E\u0635"}`
+      });
+      if (!r.ok) errors.push(`${p.coin} \u0645\u062D\u0627\u0641\u0638: ${r.errors.join(" | ").slice(0, 200)}`);
     }
   }
   for (const p of positions) {
@@ -33371,6 +33437,12 @@ async function runCycle({ dryRun = true, scanResult = null } = {}) {
   for (const r of scanData.rows || []) {
     const coin = r.coin.toUpperCase();
     if (openCoins.has(coin)) continue;
+    const cd = (st.cooldown || {})[coin];
+    if (cd && Date.now() - cd < CFG.cooldownMin * 6e4) {
+      const left = Math.ceil((CFG.cooldownMin * 6e4 - (Date.now() - cd)) / 6e4);
+      actions.push({ coin, action: "SKIP", reason: `\u06A9\u0648\u0644\u200C\u062F\u0627\u0648\u0646 \u0628\u0639\u062F \u0627\u0632 \u062E\u0631\u0648\u062C \xB7 ${left} \u062F\u0642\u06CC\u0642\u0647 \u0645\u0627\u0646\u062F\u0647` });
+      continue;
+    }
     if (r.score >= CFG.minScore && r.trendUp === true) {
       candidates.push({ ...r, side: "long", reason: `\u0627\u0645\u062A\u06CC\u0627\u0632 ${r.score} \xB7 \u0628\u0627\u0644\u0627\u06CC MA50` });
     } else if (CFG.allowShort && r.score <= -CFG.shortScore && r.trendUp === false && (r.rsi ?? 100) < CFG.rsiMax) {
@@ -33436,9 +33508,16 @@ async function runCycle({ dryRun = true, scanResult = null } = {}) {
       trade.size = Number(filled.totalSz);
       trade.sl = +(trade.entry * (isShort ? 1 + CFG.slPct / 100 : 1 - CFG.slPct / 100)).toFixed(6);
       trade.tp = +(trade.entry * (isShort ? 1 - CFG.tpPct / 100 : 1 + CFG.tpPct / 100)).toFixed(6);
-      const slR = await triggerOrder({ coin: c.coin, isBuy: isShort, size: trade.size, triggerPx: trade.sl, kind: "sl" });
-      const tpR = await triggerOrder({ coin: c.coin, isBuy: isShort, size: trade.size, triggerPx: trade.tp, kind: "tp" });
-      trade.oids = { sl: slR.response?.data?.statuses?.[0]?.resting?.oid, tp: tpR.response?.data?.statuses?.[0]?.resting?.oid };
+      const prot = await protectPosition({ coin: c.coin, isShort, size: trade.size, entry: trade.entry });
+      if (!prot.ok) {
+        await marketOrder({ coin: c.coin, isBuy: isShort, size: trade.size, reduceOnly: true, slippagePct: 1 }).catch(() => {
+        });
+        const why = prot.errors.slice(-1)[0] || "\u0646\u0627\u0645\u0634\u062E\u0635";
+        errors.push(`${c.coin} \u0645\u062D\u0627\u0641\u0638 \u062B\u0628\u062A \u0646\u0634\u062F \u2192 \u067E\u0648\u0632\u06CC\u0634\u0646 \u0628\u0633\u062A\u0647 \u0634\u062F: ${why}`);
+        actions.push({ coin: c.coin, action: "ABORT", reason: `\u0627\u0633\u062A\u0627\u067E \u062B\u0628\u062A \u0646\u0634\u062F \u2192 \u067E\u0648\u0632\u06CC\u0634\u0646 \u0641\u0648\u0631\u0627\u064B \u0628\u0633\u062A\u0647 \u0634\u062F (${why})` });
+        continue;
+      }
+      trade.oids = { sl: null, tp: null };
       trade.status = "open";
       st.trades.push(trade);
       actions.push({
@@ -33473,6 +33552,47 @@ async function openOrders(coin) {
   }).then((r) => r.json());
   const { universe } = await getMeta();
   return oo.filter((o) => o.coin.toUpperCase() === coin.toUpperCase()).map((o) => ({ oid: o.oid, assetIndex: indexOf(universe, o.coin) }));
+}
+async function allOpenOrders() {
+  const oo = await fetch(hlConfig().api + "/info", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ type: "frontendOpenOrders", user: process.env.HL_ACCOUNT })
+  }).then((r) => r.json());
+  return Array.isArray(oo) ? oo : [];
+}
+function protectionOf(orders, coin) {
+  const list = orders.filter((o) => String(o.coin).toUpperCase() === coin.toUpperCase() && o.isTrigger);
+  return {
+    sl: list.some((o) => /stop/i.test(o.orderType || "")),
+    tp: list.some((o) => /take\s*profit/i.test(o.orderType || ""))
+  };
+}
+async function protectPosition({ coin, isShort, size, entry }, { attempts = 3 } = {}) {
+  const slPx = +(entry * (isShort ? 1 + CFG.slPct / 100 : 1 - CFG.slPct / 100)).toFixed(6);
+  const tpPx = +(entry * (isShort ? 1 - CFG.tpPct / 100 : 1 + CFG.tpPct / 100)).toFixed(6);
+  const want = { sl: slPx, tp: tpPx };
+  const done = { sl: false, tp: false };
+  const errs = [];
+  for (let a = 0; a < attempts; a++) {
+    const orders = await allOpenOrders().catch(() => []);
+    const have = protectionOf(orders, coin);
+    for (const kind of ["sl", "tp"]) {
+      if (have[kind]) {
+        done[kind] = true;
+        continue;
+      }
+      try {
+        await triggerOrder({ coin, isBuy: isShort, size, triggerPx: want[kind], kind });
+        done[kind] = true;
+      } catch (e) {
+        errs.push(`${kind} ${want[kind]}: ${e.message}`);
+      }
+      await new Promise((s) => setTimeout(s, 900));
+    }
+    if (done.sl && done.tp) break;
+  }
+  return { ok: done.sl && done.tp, sl: want.sl, tp: want.tp, errors: errs };
 }
 async function publicState() {
   const st = load();
