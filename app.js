@@ -33392,7 +33392,7 @@ async function runCycle({ dryRun = true, scanResult = null } = {}) {
       actions.push({ coin: c.coin, action: "SKIP", reason: `\u0645\u0627\u0631\u062C\u06CC\u0646 \u0628\u06CC\u0634 \u0627\u0632 ${CFG.marginCapPct}\u066A \u0633\u0631\u0645\u0627\u06CC\u0647` });
       continue;
     }
-    const targetNotional = CFG.notionalUsd * 1.02;
+    const targetNotional = CFG.notionalUsd * 1.1;
     const size = targetNotional / c.price;
     const isShort = c.side === "short";
     const trade = {
@@ -33423,7 +33423,7 @@ async function runCycle({ dryRun = true, scanResult = null } = {}) {
     try {
       const dz = uinfo ? uinfo.szDecimals : 4;
       const szRounded = Number(Number(size).toFixed(dz));
-      if (!(szRounded > 0) || szRounded * c.price < 10.2) {
+      if (!(szRounded > 0) || szRounded * c.price < 10.02) {
         actions.push({ coin: c.coin, action: "SKIP", reason: `\u062D\u062C\u0645 ${szRounded} \u0627\u0631\u0632\u0634 $${(szRounded * c.price).toFixed(2)} < \u062D\u062F\u0627\u0642\u0644 $\u06F1\u06F0` });
         continue;
       }
