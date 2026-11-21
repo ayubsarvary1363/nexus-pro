@@ -33358,7 +33358,17 @@ async function syncPositions() {
   const acc = await getAccount2();
   return acc.positions;
 }
-async function runCycle({ dryRun = true, scanResult = null } = {}) {
+var cycleBusy = false;
+async function runCycle(opts = {}) {
+  if (cycleBusy) return { skipped: true, reason: "\u0686\u0631\u062E\u0647\u0654 \u0642\u0628\u0644\u06CC \u062F\u0631 \u062D\u0627\u0644 \u0627\u062C\u0631\u0627\u0633\u062A" };
+  cycleBusy = true;
+  try {
+    return await runCycleInner(opts);
+  } finally {
+    cycleBusy = false;
+  }
+}
+async function runCycleInner({ dryRun = true, scanResult = null } = {}) {
   const st = load();
   const actions = [];
   const errors = [];
@@ -33839,6 +33849,7 @@ var HL_PAGE = [
   "var done=(d.closed||[]).filter(function(x){return x.ok}),bad=(d.closed||[]).filter(function(x){return !x.ok});",
   "var lk=done.filter(function(x){return x.locked}).map(function(x){return x.coin}),fr=done.filter(function(x){return !x.locked}).map(function(x){return x.coin});",
   'var tx=done.length?(done.length+" \u0645\u0639\u0627\u0645\u0644\u0647 \u0628\u0633\u062A\u0647 \u0634\u062F")+(lk.length?" \xB7 \u0642\u0641\u0644: "+lk.join("\u060C "):"")+(fr.length?" \xB7 \u0628\u062F\u0648\u0646 \u0642\u0641\u0644: "+fr.join("\u060C "):"")+(bad.length?" \xB7 \u0646\u0627\u0645\u0648\u0641\u0642: "+bad.map(function(x){return x.coin}).join("\u060C "):""):"\u0645\u0639\u0627\u0645\u0644\u0647\u200C\u0627\u06CC \u0628\u0631\u0627\u06CC \u0628\u0633\u062A\u0646 \u0646\u0628\u0648\u062F";',
+  'if(d.rescan&&done.length)tx+=" \xB7 \u0628\u0631\u0631\u0633\u06CC \u0628\u0627\u0632\u0627\u0631 \u0634\u0631\u0648\u0639 \u0634\u062F";',
   'msg(tx,done.length?"#34d399":"#f0596b");',
   'b.textContent=origTxt;b.disabled=false;b.style.background="linear-gradient(160deg,#c0392b,#8e1f1a)";',
   "setTimeout(tick,1200);",
@@ -33852,7 +33863,7 @@ var HL_PAGE = [
   ".then(function(r){return r.json()}).then(function(d){",
   'if(!d.ok){msg("\u062E\u0637\u0627: "+(d.error||"\u0646\u0627\u0645\u0634\u062E\u0635"),"#f0596b");b.textContent="\u0628\u0633\u062A\u0646";b.disabled=false;return}',
   "var x=(d.closed||[])[0]||{};",
-  'var t=coin+" \u0628\u0633\u062A\u0647 \u0634\u062F"+(x.pnl!=null?(" \xB7 "+(x.pnl>=0?"+":"\\u2212")+"$"+Math.abs(x.pnl).toFixed(2)):"")+(x.locked?" \xB7 \u0642\u0641\u0644 \u0634\u062F":" \xB7 \u0628\u062F\u0648\u0646 \u0642\u0641\u0644");',
+  'var t=coin+" \u0628\u0633\u062A\u0647 \u0634\u062F"+(x.pnl!=null?(" \xB7 "+(x.pnl>=0?"+":"\\u2212")+"$"+Math.abs(x.pnl).toFixed(2)):"")+(x.locked?" \xB7 \u0642\u0641\u0644 \u0634\u062F":" \xB7 \u0628\u062F\u0648\u0646 \u0642\u0641\u0644")+(d.rescan?" \xB7 \u0628\u0631\u0631\u0633\u06CC \u0628\u0627\u0632\u0627\u0631\u2026":"");',
   'msg(t,x.ok?"#34d399":"#f0596b");setTimeout(tick,1200);',
   '}).catch(function(){msg("\u062E\u0637\u0627\u06CC \u0634\u0628\u06A9\u0647","#f0596b");b.textContent="\u0628\u0633\u062A\u0646";b.disabled=false})}',
   "tick();setInterval(tick,5000);",
@@ -35229,7 +35240,11 @@ var server = http2.createServer(async (req, res) => {
       }
       lastCloseAllAt = nowMs;
       const r = await closeAllPositions({ reason: "\u062F\u06A9\u0645\u0647\u0654 \u0628\u0633\u062A\u0646 \u0647\u0645\u0647" });
-      return sendJson(res, 200, { ok: true, ...r });
+      if (hlConfig().liveConfirm) {
+        runCycle({ dryRun: false }).catch(() => {
+        });
+      }
+      return sendJson(res, 200, { ok: true, rescan: true, ...r });
     }
     if (req.method === "POST" && pathname === "/api/hl/public/close-one") {
       const body = await readJsonBody(req);
@@ -35254,7 +35269,11 @@ var server = http2.createServer(async (req, res) => {
       lastCloseOneAt = nowMs;
       const r = await closeOnePosition(coin, { reason: `\u0628\u0633\u062A\u0646 ${coin} \u0627\u0632 \u067E\u0646\u0644` });
       if (r.notFound) return sendJson(res, 404, { ok: false, error: `\u067E\u0648\u0632\u06CC\u0634\u0646\u06CC \u0628\u0631\u0627\u06CC ${coin} \u0628\u0627\u0632 \u0646\u06CC\u0633\u062A` });
-      return sendJson(res, 200, { ok: true, ...r });
+      if (hlConfig().liveConfirm) {
+        runCycle({ dryRun: false }).catch(() => {
+        });
+      }
+      return sendJson(res, 200, { ok: true, rescan: true, ...r });
     }
     if (req.method === "GET" && (pathname === "/hl" || pathname === "/hl/")) {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
@@ -35709,6 +35728,25 @@ if (String(process.env.HL_AUTORUN || "") === "1" && process.env.HL_AGENT_KEY) {
   };
   setTimeout(tick, 2e4);
   setInterval(tick, everyMin * 6e4);
+  let watching = false;
+  const watchClosed = async () => {
+    if (watching) return;
+    watching = true;
+    try {
+      const acc = await getAccount2();
+      const onEx = new Set(acc.positions.map((p) => String(p.coin).toUpperCase()));
+      const known = (botState().openTrades || []).filter((t) => t.status === "open").map((t) => String(t.coin).toUpperCase());
+      const gone = known.filter((c) => !onEx.has(c));
+      if (gone.length) {
+        console.log(`[hl-bot] \u0628\u0633\u062A\u0647 \u0634\u062F: ${gone.join(", ")} \u2192 \u0627\u0633\u06A9\u0646 \u0641\u0648\u0631\u06CC`);
+        await tick();
+      }
+    } catch (e) {
+    } finally {
+      watching = false;
+    }
+  };
+  setInterval(watchClosed, 6e4);
 }
 /*! Bundled license information:
 
