@@ -33107,10 +33107,13 @@ async function getAccount2() {
   const perpsValue = Number(s.marginSummary?.accountValue || 0);
   return {
     account: ACCOUNT,
-    // accountValue صرافی همان عددی است که سایت Hyperliquid نشان می‌دهد و سود/زیان باز را
-    // از قبل در خود دارد. اسپات USDC هم همان پول است (حساب یکپارچه)، پس نباید دوباره
-    // با upnl جمع شود — قبلاً همین اشتباه، موجودی را به اندازهٔ سود باز بیشتر نشان می‌داد.
-    equity: perpsValue > 0 ? perpsValue : spotUsdc,
+    // دارایی کل = بزرگ‌ترِ دو عدد زیر (بدون جمع‌کردن دوبارهٔ سود باز):
+    //   • وقتی سرمایهٔ آزاد زیاد است، Hyperliquid آن را در «اسپات» نگه می‌دارد و
+    //     accountValue فقط به اندازهٔ مارجینِ در استفاده کوچک می‌شود (مثلاً ۲.۲۱ از ۹.۳۷)
+    //   • وقتی همهٔ سرمایه در مارجین است، هر دو عدد یکی می‌شوند
+    // پس max، هم عدد صرافی را نشان می‌دهد و هم قدرت خرید واقعی را از دست نمی‌دهد.
+    equity: Math.max(perpsValue, spotUsdc),
+    freeMargin: Math.max(0, spotUsdc - Number(s.marginSummary?.totalMarginUsed || 0)),
     perpsValue,
     spotUsdc,
     upnl: upnlSum,
@@ -33278,10 +33281,12 @@ var CFG = {
   tpPct: Number(process.env.HL_TP_PCT || 8),
   maxPositions: Number(process.env.HL_MAX_POSITIONS || 3),
   maxHoldBars: Number(process.env.HL_MAX_HOLD_BARS || 48),
-  marginCapPct: Number(process.env.HL_MARGIN_CAP_PCT || 60),
+  marginCapPct: Number(process.env.HL_MARGIN_CAP_PCT || 95),
   // حداکثر درصد سرمایه در مارجین
   // بعد از بسته شدن یک معامله، تا این مدت دوباره وارد همان سکه نشو (ثانیه‌ای که استاپ خورد و ۱۱ دقیقه بعد دوباره وارد شد)
   cooldownMin: Number(process.env.HL_SL_COOLDOWN_MIN || 120),
+  // گارد سود/زیان: اگر مجموع سود/زیان باز از این درصدِ دارایی بیشتر شود، همه بسته می‌شوند
+  pnlGuardPct: Number(process.env.HL_PNL_GUARD_PCT || 10),
   // شورت: بک‌تست ۶ ساله — PF 1.25، در هر سال مثبت
   allowShort: String(process.env.HL_SHORT || "1") !== "0",
   shortScore: Number(process.env.HL_SHORT_SCORE || 20),
@@ -33469,7 +33474,9 @@ async function runCycleInner({ dryRun = true, scanResult = null } = {}) {
   const free = CFG.maxPositions - positions.length;
   const scanData = scanResult || await scan();
   const acc = await getAccount2();
-  const equity = acc.equity + (acc.positions.length ? 0 : 0);
+  const equity = acc.equity;
+  let usedMargin = Number(acc.marginUsed || 0);
+  let freeMarginAvail = Number(acc.freeMargin ?? Math.max(0, acc.spotUsdc - usedMargin));
   const candidates = [];
   for (const r of scanData.rows || []) {
     const coin = r.coin.toUpperCase();
@@ -33497,8 +33504,21 @@ async function runCycleInner({ dryRun = true, scanResult = null } = {}) {
     const uinfo = uni.find((x) => x.name.toUpperCase() === c.coin.toUpperCase());
     const levUse = Math.min(CFG.leverage, uinfo?.maxLeverage || CFG.leverage);
     const marginNeeded = CFG.notionalUsd / levUse;
-    if (marginNeeded > equity * CFG.marginCapPct / 100) {
-      actions.push({ coin: c.coin, action: "SKIP", reason: `\u0645\u0627\u0631\u062C\u06CC\u0646 \u0628\u06CC\u0634 \u0627\u0632 ${CFG.marginCapPct}\u066A \u0633\u0631\u0645\u0627\u06CC\u0647` });
+    const capUsd = equity * CFG.marginCapPct / 100;
+    if (usedMargin + marginNeeded > capUsd + 1e-9) {
+      actions.push({
+        coin: c.coin,
+        action: "SKIP",
+        reason: `\u0633\u0642\u0641 \u0645\u0627\u0631\u062C\u06CC\u0646 ${CFG.marginCapPct}\u066A \u067E\u0631 \u0627\u0633\u062A (${usedMargin.toFixed(2)} \u0627\u0632 ${capUsd.toFixed(2)})`
+      });
+      continue;
+    }
+    if (marginNeeded > freeMarginAvail + 1e-9) {
+      actions.push({
+        coin: c.coin,
+        action: "SKIP",
+        reason: `\u0645\u0627\u0631\u062C\u06CC\u0646 \u0622\u0632\u0627\u062F \u06A9\u0627\u0641\u06CC \u0646\u06CC\u0633\u062A (${freeMarginAvail.toFixed(2)} < ${marginNeeded.toFixed(2)})`
+      });
       continue;
     }
     const targetNotional = CFG.notionalUsd * 1.1;
@@ -33554,6 +33574,8 @@ async function runCycleInner({ dryRun = true, scanResult = null } = {}) {
         actions.push({ coin: c.coin, action: "ABORT", reason: `\u0627\u0633\u062A\u0627\u067E \u062B\u0628\u062A \u0646\u0634\u062F \u2192 \u067E\u0648\u0632\u06CC\u0634\u0646 \u0641\u0648\u0631\u0627\u064B \u0628\u0633\u062A\u0647 \u0634\u062F (${why})` });
         continue;
       }
+      usedMargin += marginNeeded;
+      freeMarginAvail = Math.max(0, freeMarginAvail - marginNeeded);
       trade.oids = { sl: null, tp: null };
       trade.status = "open";
       st.trades.push(trade);
@@ -33704,6 +33726,37 @@ async function closeMany(coins, reason) {
   save(st);
   return { closed: out, cooldownMin: CFG.cooldownMin };
 }
+function guardOf(st) {
+  const g = st.guard || {};
+  return {
+    enabled: g.enabled === void 0 ? String(process.env.HL_PNL_GUARD || "1") !== "0" : Boolean(g.enabled),
+    pct: Number(g.pct || CFG.pnlGuardPct)
+  };
+}
+async function setGuard(patch = {}) {
+  const st = load();
+  const cur = guardOf(st);
+  st.guard = {
+    enabled: patch.enabled === void 0 ? cur.enabled : Boolean(patch.enabled),
+    pct: patch.pct === void 0 ? cur.pct : Math.max(0.5, Math.min(50, Number(patch.pct)))
+  };
+  save(st);
+  return st.guard;
+}
+async function checkPnlGuard() {
+  const st = load();
+  const g = guardOf(st);
+  if (!g.enabled) return { skipped: "guard-off" };
+  const acc = await getAccount2();
+  if (!acc.positions.length) return { skipped: "no-positions", guard: g };
+  const limit = acc.equity * g.pct / 100;
+  const upnl = Number(acc.upnl || 0);
+  if (Math.abs(upnl) < limit) return { skipped: "under-limit", upnl, limit, guard: g };
+  const r = await closeAllPositions({
+    reason: `\u06AF\u0627\u0631\u062F ${g.pct}\u066A \xB7 \u0633\u0648\u062F/\u0632\u06CC\u0627\u0646 \u0628\u0627\u0632 ${upnl >= 0 ? "+" : "\u2212"}$${Math.abs(upnl).toFixed(2)}`
+  });
+  return { triggered: true, upnl, limit, guard: g, closed: r.closed };
+}
 async function publicState() {
   const st = load();
   let positions = [];
@@ -33716,7 +33769,7 @@ async function publicState() {
     equity = acc.equity;
     upnl = acc.upnl || 0;
     marginUsed = acc.marginUsed || 0;
-    freeMargin = acc.withdrawable || 0;
+    freeMargin = acc.freeMargin ?? Math.max(0, (acc.spotUsdc || 0) - (acc.marginUsed || 0));
     const mids = await getMids();
     positions = acc.positions.map((p) => ({
       coin: p.coin,
@@ -33745,6 +33798,7 @@ async function publicState() {
     positions,
     top,
     recent,
+    guard: guardOf(st),
     openTrades: (st.trades || []).filter((t) => t.status === "open").length
   };
 }
@@ -33808,6 +33862,10 @@ var HL_PAGE = [
   `h+='<div class="r"><span class="k">\u0633\u0648\u062F/\u0632\u06CC\u0627\u0646 \u0628\u0627\u0632</span><span class="v '+(d.upnl>=0?"up":"down")+'">'+mo(d.upnl)+'</span></div>';`,
   `h+='<div class="r"><span class="k">\u062F\u0631 \u0645\u0627\u0631\u062C\u06CC\u0646</span><span class="v">'+mo(d.marginUsed||0)+'</span></div>';`,
   `h+='<div class="r"><span class="k">\u0622\u0632\u0627\u062F (\u0642\u0627\u0628\u0644 \u0628\u0631\u062F\u0627\u0634\u062A)</span><span class="v">'+mo(d.freeMargin||0)+'</span></div>';`,
+  "var gd=d.guard||{enabled:false,pct:5};",
+  `h+='<div class="r"><span class="k">\u06AF\u0627\u0631\u062F '+gd.pct+'\u066A \u0633\u0648\u062F/\u0632\u06CC\u0627\u0646 \u0628\u0627\u0632</span><span class="v" style="color:'+(gd.enabled?"#34d399":"#7d8ca3")+'">'+(gd.enabled?"\u0631\u0648\u0634\u0646":"\u062E\u0627\u0645\u0648\u0634")+'</span></div>';`,
+  `h+='<div class="r"><span class="k">\u0622\u0633\u062A\u0627\u0646\u0647</span><span class="v" style="display:flex;align-items:center;gap:10px"><button onclick="setPct(-5)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">\u2212</button><b>'+gd.pct+'\u066A</b><button onclick="setPct(5)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">+</button></span></div>';`,
+  `h+='<div style="padding-top:8px"><button onclick="toggleGuard()" style="width:100%;padding:11px;font-size:13px;font-weight:700;border-radius:11px;font-family:inherit;background:'+(gd.enabled?"#12301f":"#1a2334")+';color:'+(gd.enabled?"#34d399":"#8fa0b8")+';border:1px solid '+(gd.enabled?"#1f6b4a":"#243349")+'">'+(gd.enabled?"\u06AF\u0627\u0631\u062F \u0631\u0648\u0634\u0646 \u0627\u0633\u062A \u2014 \u0628\u0631\u0627\u06CC \u062E\u0627\u0645\u0648\u0634 \u06A9\u0631\u062F\u0646 \u0628\u0632\u0646":"\u06AF\u0627\u0631\u062F \u062E\u0627\u0645\u0648\u0634 \u0627\u0633\u062A \u2014 \u0628\u0631\u0627\u06CC \u0631\u0648\u0634\u0646 \u06A9\u0631\u062F\u0646 \u0628\u0632\u0646")+'</button></div>';`,
   `h+='<div class="r"><span class="k">\u067E\u0648\u0632\u06CC\u0634\u0646 \u0628\u0627\u0632</span><span class="v">'+d.positions.length+" \u0627\u0632 "+d.cfg.maxPositions+'</span></div></div>';`,
   // پوزیشن‌ها
   "if(d.positions.length){",
@@ -33832,6 +33890,7 @@ var HL_PAGE = [
   `h+='<div class="c"><div class="t">\u0622\u062E\u0631\u06CC\u0646 \u0627\u0642\u062F\u0627\u0645\u200C\u0647\u0627</div><div class="log">';`,
   'for(const a of d.recent)h+=a.coin+" \xB7 "+a.action+" \xB7 "+(a.reason||"")+"<br>";',
   'h+="</div></div>";}',
+  "window.__gd=d.guard||{enabled:false,pct:5};",
   'document.getElementById("app").innerHTML=h;',
   'var bb=document.getElementById("btnAll");bb.style.display=d.positions.length?"block":"none";}',
   'async function tick(){try{const r=await fetch("/api/hl/public/state");render(await r.json())}catch(e){}}',
@@ -33866,6 +33925,14 @@ var HL_PAGE = [
   'var t=coin+" \u0628\u0633\u062A\u0647 \u0634\u062F"+(x.pnl!=null?(" \xB7 "+(x.pnl>=0?"+":"\\u2212")+"$"+Math.abs(x.pnl).toFixed(2)):"")+(x.locked?" \xB7 \u0642\u0641\u0644 \u0634\u062F":" \xB7 \u0628\u062F\u0648\u0646 \u0642\u0641\u0644")+(d.rescan?" \xB7 \u0628\u0631\u0631\u0633\u06CC \u0628\u0627\u0632\u0627\u0631\u2026":"");',
   'msg(t,x.ok?"#34d399":"#f0596b");setTimeout(tick,1200);',
   '}).catch(function(){msg("\u062E\u0637\u0627\u06CC \u0634\u0628\u06A9\u0647","#f0596b");b.textContent="\u0628\u0633\u062A\u0646";b.disabled=false})}',
+  "function setPct(delta){var gd=window.__gd||{enabled:true,pct:10};var p=Math.max(2,Math.min(50,Number(gd.pct)+delta));",
+  'fetch("/api/hl/public/guard",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({pct:p})})',
+  '.then(function(r){return r.json()}).then(function(d){if(d.ok){msg("\u0622\u0633\u062A\u0627\u0646\u0647 \u0634\u062F "+d.guard.pct+"\u066A","#34d399");setTimeout(tick,400)}else{msg("\u062E\u0637\u0627: "+(d.error||"?"),"#f0596b")}})',
+  '.catch(function(){msg("\u062E\u0637\u0627\u06CC \u0634\u0628\u06A9\u0647","#f0596b")})}',
+  "function toggleGuard(){var gd=window.__gd||{enabled:false};",
+  'fetch("/api/hl/public/guard",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({enabled:!gd.enabled})})',
+  '.then(function(r){return r.json()}).then(function(d){if(d.ok){msg("\u06AF\u0627\u0631\u062F "+(d.guard.enabled?"\u0631\u0648\u0634\u0646":"\u062E\u0627\u0645\u0648\u0634")+" \u0634\u062F \xB7 \u0622\u0633\u062A\u0627\u0646\u0647 "+d.guard.pct+"\u066A",d.guard.enabled?"#34d399":"#f0596b");setTimeout(tick,600)}else{msg("\u062E\u0637\u0627: "+(d.error||"\u0646\u0627\u0645\u0634\u062E\u0635"),"#f0596b")}})',
+  '.catch(function(){msg("\u062E\u0637\u0627\u06CC \u0634\u0628\u06A9\u0647","#f0596b")})}',
   "tick();setInterval(tick,5000);",
   "</script></body></html>"
 ].join("\n");
@@ -35162,6 +35229,7 @@ function isAuthorized(req, url) {
   if (url.pathname === "/api/hl/public/state") return true;
   if (url.pathname === "/api/hl/public/close-all") return true;
   if (url.pathname === "/api/hl/public/close-one") return true;
+  if (url.pathname === "/api/hl/public/guard") return true;
   if (!url.pathname.startsWith("/api/")) return true;
   const header = req.headers["x-app-password"];
   if (header && header === APP_PASSWORD) return true;
@@ -35274,6 +35342,14 @@ var server = http2.createServer(async (req, res) => {
         });
       }
       return sendJson(res, 200, { ok: true, rescan: true, ...r });
+    }
+    if (req.method === "POST" && pathname === "/api/hl/public/guard") {
+      const body = await readJsonBody(req);
+      const g = await setGuard({
+        enabled: body?.enabled,
+        pct: body?.pct
+      });
+      return sendJson(res, 200, { ok: true, guard: g });
     }
     if (req.method === "GET" && (pathname === "/hl" || pathname === "/hl/")) {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
@@ -35711,6 +35787,25 @@ var PORT = Number(process.env.PORT) || 3e3;
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Nexus Pro v2.0 Live Trading Server running on http://0.0.0.0:${PORT}`);
 });
+if (process.env.HL_AGENT_KEY) {
+  let guardBusy = false;
+  setInterval(async () => {
+    if (guardBusy) return;
+    guardBusy = true;
+    try {
+      const r = await checkPnlGuard();
+      if (r.triggered) {
+        const ok = (r.closed || []).filter((c) => c.ok).length;
+        console.log(`[hl-bot] \u06AF\u0627\u0631\u062F ${r.guard.pct}\u066A \u0641\u0639\u0627\u0644 \u0634\u062F: PnL \u0628\u0627\u0632 ${r.upnl.toFixed(2)} (\u062D\u062F ${r.limit.toFixed(2)}) \u2192 ${ok} \u067E\u0648\u0632\u06CC\u0634\u0646 \u0628\u0633\u062A\u0647 \u0634\u062F`);
+        if (hlConfig().liveConfirm) runCycle({ dryRun: false }).catch(() => {
+        });
+      }
+    } catch (e) {
+    } finally {
+      guardBusy = false;
+    }
+  }, 6e4);
+}
 if (String(process.env.HL_AUTORUN || "") === "1" && process.env.HL_AGENT_KEY) {
   const everyMin = Math.max(15, Number(process.env.HL_INTERVAL_MIN) || 60);
   const live = String(process.env.HL_LIVE_CONFIRM || "").toUpperCase() === "YES";
