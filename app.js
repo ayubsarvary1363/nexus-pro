@@ -33434,21 +33434,20 @@ async function runCycleInner({ dryRun = true, scanResult = null } = {}) {
     }
   }
   if (!dryRun && positions.length) {
-    const orders = await allOpenOrders().catch(() => []);
     for (const p of positions) {
-      const have = protectionOf(orders, p.coin);
-      if (have.sl && have.tp) continue;
       const r = await protectPosition({
         coin: p.coin,
         isShort: p.size < 0,
         size: Math.abs(p.size),
         entry: p.entry
       });
-      actions.push({
-        coin: p.coin,
-        action: r.ok ? "PROTECT" : "PROTECT_FAIL",
-        reason: r.ok ? `\u0645\u062D\u0627\u0641\u0638 \u062A\u06A9\u0645\u06CC\u0644 \u0634\u062F (\u0627\u0633\u062A\u0627\u067E ${r.sl} \xB7 \u0647\u062F\u0641 ${r.tp})` : `\u0645\u062D\u0627\u0641\u0638 \u062B\u0628\u062A \u0646\u0634\u062F: ${r.errors.slice(-1)[0] || "\u0646\u0627\u0645\u0634\u062E\u0635"}`
-      });
+      if (!r.ok || r.changed) {
+        actions.push({
+          coin: p.coin,
+          action: r.ok ? "PROTECT" : "PROTECT_FAIL",
+          reason: r.ok ? `\u0645\u062D\u0627\u0641\u0638 \u0627\u0635\u0644\u0627\u062D/\u062A\u06A9\u0645\u06CC\u0644 \u0634\u062F (\u0627\u0633\u062A\u0627\u067E ${r.sl} \xB7 \u0647\u062F\u0641 ${r.tp})` : `\u0645\u062D\u0627\u0641\u0638 \u062B\u0628\u062A \u0646\u0634\u062F: ${r.errors.slice(-1)[0] || "\u0646\u0627\u0645\u0634\u062E\u0635"}`
+        });
+      }
       if (!r.ok) errors.push(`${p.coin} \u0645\u062D\u0627\u0641\u0638: ${r.errors.join(" | ").slice(0, 200)}`);
     }
   }
@@ -33620,111 +33619,59 @@ async function allOpenOrders() {
   }).then((r) => r.json());
   return Array.isArray(oo) ? oo : [];
 }
-function protectionOf(orders, coin) {
-  const list = orders.filter((o) => String(o.coin).toUpperCase() === coin.toUpperCase() && o.isTrigger);
-  return {
-    sl: list.some((o) => /stop/i.test(o.orderType || "")),
-    tp: list.some((o) => /take\s*profit/i.test(o.orderType || ""))
-  };
-}
 async function protectPosition({ coin, isShort, size, entry }, { attempts = 3 } = {}) {
   const slPx = +(entry * (isShort ? 1 + CFG.slPct / 100 : 1 - CFG.slPct / 100)).toFixed(6);
   const tpPx = +(entry * (isShort ? 1 - CFG.tpPct / 100 : 1 + CFG.tpPct / 100)).toFixed(6);
   const want = { sl: slPx, tp: tpPx };
-  const done = { sl: false, tp: false };
   const errs = [];
+  let changed = false;
+  const C = coin.toUpperCase();
+  const closeEnough = (o, px) => {
+    const szOk = Math.abs(Number(o.sz) - size) <= Math.max(1e-9, size * 2e-3);
+    const pxOk = Math.abs(Number(o.triggerPx) - px) / px <= 0.02;
+    return szOk && pxOk;
+  };
+  const pick = (list) => ({
+    sl: list.find((o) => /stop/i.test(o.orderType || "") && !/take/i.test(o.orderType || "")),
+    tp: list.find((o) => /take\s*profit/i.test(o.orderType || ""))
+  });
   for (let a = 0; a < attempts; a++) {
-    const orders = await allOpenOrders().catch(() => []);
-    const have = protectionOf(orders, coin);
-    for (const kind of ["sl", "tp"]) {
-      if (have[kind]) {
-        done[kind] = true;
-        continue;
+    const orders2 = await allOpenOrders().catch(() => []);
+    const mine2 = orders2.filter((o) => String(o.coin).toUpperCase() === C && o.isTrigger);
+    const { sl: slOrder, tp: tpOrder } = pick(mine2);
+    const slOk = Boolean(slOrder && closeEnough(slOrder, slPx));
+    const tpOk = Boolean(tpOrder && closeEnough(tpOrder, tpPx));
+    const stale = [];
+    if (slOrder && !slOk) stale.push(slOrder);
+    if (tpOrder && !tpOk) stale.push(tpOrder);
+    for (const o of mine2) if (o !== slOrder && o !== tpOrder) stale.push(o);
+    if (stale.length) {
+      try {
+        const oids = await openOrders(coin);
+        await cancelOrders(oids.map((o) => ({ a: o.assetIndex ?? 0, oid: o.oid })));
+        changed = true;
+        await new Promise((r) => setTimeout(r, 600));
+      } catch (e) {
+        errs.push("\u0644\u063A\u0648 \u0633\u0641\u0627\u0631\u0634 \u0646\u0627\u0647\u0645\u062E\u0648\u0627\u0646: " + e.message);
       }
+      continue;
+    }
+    if (slOk && tpOk) return { ok: true, changed, sl: slPx, tp: tpPx, errors: errs };
+    for (const kind of ["sl", "tp"]) {
       try {
         await triggerOrder({ coin, isBuy: isShort, size, triggerPx: want[kind], kind });
-        done[kind] = true;
+        changed = true;
       } catch (e) {
         errs.push(`${kind} ${want[kind]}: ${e.message}`);
       }
-      await new Promise((s) => setTimeout(s, 900));
-    }
-    if (done.sl && done.tp) break;
-  }
-  return { ok: done.sl && done.tp, sl: want.sl, tp: want.tp, errors: errs };
-}
-async function closeAllPositions({ reason = "\u0628\u0633\u062A\u0646 \u062F\u0633\u062A\u06CC \u0627\u0632 \u067E\u0646\u0644" } = {}) {
-  return closeMany(null, reason);
-}
-async function closeOnePosition(coin, { reason = "\u0628\u0633\u062A\u0646 \u06CC\u06A9 \u067E\u0648\u0632\u06CC\u0634\u0646 \u0627\u0632 \u067E\u0646\u0644" } = {}) {
-  const want = String(coin || "").toUpperCase();
-  const r = await closeMany([want], reason);
-  if (!r.closed.length) r.notFound = true;
-  return r;
-}
-async function closeMany(coins, reason) {
-  const all = await syncPositions();
-  const positions = coins ? all.filter((p) => coins.includes(String(p.coin).toUpperCase())) : all;
-  const out = [];
-  for (const p of positions) {
-    const coin = p.coin;
-    try {
-      const oo = await openOrders(coin).catch(() => []);
-      if (oo.length) {
-        await cancelOrders(oo.map((o) => ({ a: o.assetIndex ?? 0, oid: o.oid }))).catch(() => {
-        });
-        await new Promise((s) => setTimeout(s, 350));
-      }
-      const r = await marketOrder({
-        coin,
-        isBuy: p.size < 0,
-        size: Math.abs(p.size),
-        reduceOnly: true,
-        slippagePct: 1.5
-      });
-      const filled = r?.response?.data?.statuses?.[0]?.filled;
-      let pnl = null;
-      if (filled) {
-        const avg = Number(filled.avgPx);
-        pnl = +(p.size < 0 ? (p.entry - avg) * Math.abs(p.size) : (avg - p.entry) * Math.abs(p.size)).toFixed(4);
-      }
-      out.push({ coin, ok: Boolean(filled), px: filled ? Number(filled.avgPx) : null, pnl });
-    } catch (e) {
-      out.push({ coin, ok: false, error: String(e.message || e).slice(0, 120) });
-    }
-    await new Promise((s) => setTimeout(s, 600));
-  }
-  const st = load();
-  st.cooldown = st.cooldown || {};
-  const now = Date.now();
-  for (const o of out) {
-    if (!o.ok) continue;
-    const profitable = (o.pnl ?? 0) >= 0;
-    o.locked = !profitable;
-    if (profitable) delete st.cooldown[o.coin.toUpperCase()];
-    else st.cooldown[o.coin.toUpperCase()] = now;
-    const t = (st.trades || []).find((x) => x.status === "open" && x.coin.toUpperCase() === o.coin.toUpperCase());
-    if (t) {
-      t.status = "closed";
-      t.closedAt = now;
-      t.closedBy = "panel";
-      t.pnl = o.pnl;
+      await new Promise((r) => setTimeout(r, 900));
     }
   }
-  st.log = [
-    ...st.log || [],
-    {
-      at: now,
-      dryRun: false,
-      actions: out.map((o) => ({
-        coin: o.coin,
-        action: o.ok ? "CLOSE_ALL" : "CLOSE_FAIL",
-        reason: o.ok ? `${reason} \xB7 ${o.pnl >= 0 ? "+" : "\u2212"}$${Math.abs(o.pnl ?? 0).toFixed(2)} \xB7 ${o.locked ? "\u0642\u0641\u0644 \u0634\u062F" : "\u0628\u062F\u0648\u0646 \u0642\u0641\u0644 (\u0633\u0648\u062F\u062F\u0647)"}` : `${reason} \xB7 ${o.error || "\u0646\u0627\u0645\u0648\u0641\u0642"}`
-      }))
-    }
-  ].slice(-200);
-  save(st);
-  return { closed: out, cooldownMin: CFG.cooldownMin };
+  const orders = await allOpenOrders().catch(() => []);
+  const mine = orders.filter((o) => String(o.coin).toUpperCase() === C && o.isTrigger);
+  const { sl: s2, tp: t2 } = pick(mine);
+  const ok = Boolean(s2 && closeEnough(s2, slPx) && t2 && closeEnough(t2, tpPx));
+  return { ok, changed, sl: slPx, tp: tpPx, errors: errs };
 }
 function guardOf(st) {
   const g = st.guard || {};
@@ -35307,7 +35254,7 @@ var server = http2.createServer(async (req, res) => {
         return sendJson(res, 429, { ok: false, error: "\u0647\u0645\u06CC\u0646 \u0686\u0646\u062F \u0644\u062D\u0638\u0647 \u067E\u06CC\u0634 \u0627\u062C\u0631\u0627 \u0634\u062F\u061B \u06F1\u06F5 \u062B\u0627\u0646\u06CC\u0647 \u0635\u0628\u0631 \u06A9\u0646" });
       }
       lastCloseAllAt = nowMs;
-      const r = await closeAllPositions({ reason: "\u062F\u06A9\u0645\u0647\u0654 \u0628\u0633\u062A\u0646 \u0647\u0645\u0647" });
+      const r = await (void 0)({ reason: "\u062F\u06A9\u0645\u0647\u0654 \u0628\u0633\u062A\u0646 \u0647\u0645\u0647" });
       if (hlConfig().liveConfirm) {
         runCycle({ dryRun: false }).catch(() => {
         });
@@ -35335,7 +35282,7 @@ var server = http2.createServer(async (req, res) => {
         return sendJson(res, 429, { ok: false, error: "\u06A9\u0645\u06CC \u0635\u0628\u0631 \u06A9\u0646" });
       }
       lastCloseOneAt = nowMs;
-      const r = await closeOnePosition(coin, { reason: `\u0628\u0633\u062A\u0646 ${coin} \u0627\u0632 \u067E\u0646\u0644` });
+      const r = await (void 0)(coin, { reason: `\u0628\u0633\u062A\u0646 ${coin} \u0627\u0632 \u067E\u0646\u0644` });
       if (r.notFound) return sendJson(res, 404, { ok: false, error: `\u067E\u0648\u0632\u06CC\u0634\u0646\u06CC \u0628\u0631\u0627\u06CC ${coin} \u0628\u0627\u0632 \u0646\u06CC\u0633\u062A` });
       if (hlConfig().liveConfirm) {
         runCycle({ dryRun: false }).catch(() => {
