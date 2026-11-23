@@ -3846,6 +3846,43 @@ function calcATR(candles, period = 14) {
   }
   return res;
 }
+function calcADX(candles, period = 14) {
+  const res = new Array(candles.length).fill(null);
+  if (!candles || candles.length < period * 2 + 2) return res;
+  const tr = [], pdm = [], ndm = [];
+  for (let i = 1; i < candles.length; i++) {
+    const h = candles[i].high, l = candles[i].low, pc = candles[i - 1].close;
+    tr.push(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc)));
+    const up = h - candles[i - 1].high, dn = candles[i - 1].low - l;
+    pdm.push(up > dn && up > 0 ? up : 0);
+    ndm.push(dn > up && dn > 0 ? dn : 0);
+  }
+  const smooth = (a2) => {
+    let sum = 0;
+    for (let i = 0; i < period; i++) sum += a2[i];
+    const r = [sum];
+    for (let i = period; i < a2.length; i++) {
+      sum = sum - sum / period + a2[i];
+      r.push(sum);
+    }
+    return r;
+  };
+  const trS = smooth(tr), pS = smooth(pdm), nS = smooth(ndm);
+  const dx = [];
+  for (let i = 0; i < trS.length; i++) {
+    const P = 100 * pS[i] / (trS[i] || 1e-9);
+    const N3 = 100 * nS[i] / (trS[i] || 1e-9);
+    dx.push(100 * Math.abs(P - N3) / (P + N3 || 1e-9));
+  }
+  let a = dx.slice(0, period).reduce((x, y) => x + y, 0) / period;
+  const out = [a];
+  for (let i = period; i < dx.length; i++) {
+    a = (a * (period - 1) + dx[i]) / period;
+    out.push(a);
+  }
+  for (let i = 0; i < out.length; i++) res[i + 2 * period - 1] = out[i];
+  return res;
+}
 function computeFullAnalysis(candles) {
   if (!candles || candles.length === 0) {
     return { series: {}, summary: null };
@@ -3858,6 +3895,7 @@ function computeFullAnalysis(candles) {
   const { macdLine, signalLine, histogram } = calcMACD(closes, 12, 26, 9);
   const bb = calcBollingerBands(closes, 20, 2);
   const atr14 = calcATR(candles, 14);
+  const adx14 = calcADX(candles, 14);
   const last = candles.length - 1;
   const price = closes[last];
   const curRsi = rsi14[last] ?? 50;
@@ -3872,6 +3910,7 @@ function computeFullAnalysis(candles) {
   const curBbLower = bb.lower[last] ?? price * 0.98;
   const curBbMiddle = bb.middle[last] ?? price;
   const curAtr = atr14[last] ?? price * 8e-3;
+  const curAdx = adx14[last];
   let score = 0;
   const breakdown = {};
   if (curEma9 > curEma21 && price > curEma9) {
@@ -3959,7 +3998,7 @@ function computeFullAnalysis(candles) {
       bbMiddle: mapSeries(bb.middle),
       bbLower: mapSeries(bb.lower)
     },
-    raw: { ema9, ema21, sma50, rsi14, macdLine, signalLine, histogram, bb, atr14 },
+    raw: { ema9, ema21, sma50, rsi14, macdLine, signalLine, histogram, bb, atr14, adx14 },
     summary: {
       price,
       rsi14: Number(curRsi.toFixed(2)),
@@ -3975,6 +4014,7 @@ function computeFullAnalysis(candles) {
       bbPercent: Number((bbPercent * 100).toFixed(1)),
       atr14: curAtr,
       atrPct: Number((curAtr / price * 100).toFixed(2)),
+      adx: curAdx === null || curAdx === void 0 ? null : Number(curAdx.toFixed(1)),
       score,
       signal,
       breakdown
@@ -6777,7 +6817,7 @@ function calcSupertrend(candles, period = 10, multiplier = 3) {
   }
   return dir;
 }
-function calcADX(candles, period = 14) {
+function calcADX2(candles, period = 14) {
   const len = candles.length;
   const plusDI = new Array(len).fill(null);
   const minusDI = new Array(len).fill(null);
@@ -6912,7 +6952,7 @@ function calcRegimeSeries(candles) {
   const len = closes.length;
   const ema50 = calcEMA(closes, 50);
   const ema200 = calcEMA(closes, 200);
-  const { adx, plusDI, minusDI } = calcADX(candles, 14);
+  const { adx, plusDI, minusDI } = calcADX2(candles, 14);
   const atr = calcATR(candles, 14);
   const er = calcEfficiencyRatio(closes, 20);
   const out = new Array(len).fill(null);
@@ -7210,7 +7250,7 @@ function evaluateStrategySignals(candles, strategy = "AI_CONFLUENCE", params = {
         else if (price < lo) signals[i] = "SHORT";
       }
     } else if (strategy === "ADX_DI_TREND") {
-      if (!adxData) adxData = calcADX(candles, 14);
+      if (!adxData) adxData = calcADX2(candles, 14);
       const a = adxData.adx[i];
       const pdi = adxData.plusDI[i];
       const mdi = adxData.minusDI[i];
@@ -33291,8 +33331,10 @@ var CFG = {
   allowShort: String(process.env.HL_SHORT || "1") !== "0",
   shortScore: Number(process.env.HL_SHORT_SCORE || 20),
   // آستانهٔ منفی: امتیاز ≤ −۲۰
-  rsiMax: Number(process.env.HL_RSI_MAX || 45)
+  rsiMax: Number(process.env.HL_RSI_MAX || 45),
   // شرط RSI برای شورت
+  minAdx: Number(process.env.HL_MIN_ADX || 25)
+  // کمینهٔ ADX: زیر آن روند «نامشخص» است و وارد نمی‌شویم
 };
 var STATE_FILE2 = process.env.HL_STATE_FILE || path3.join(process.cwd(), "data", "hl-state.json");
 var SETTINGS_FILE = process.env.HL_SETTINGS_FILE || path3.join(path3.dirname(STATE_FILE2), "hl-settings.json");
@@ -33323,6 +33365,7 @@ function load() {
   if (s.maxPositions === void 0 && g.maxPositions === void 0) s.maxPositions = 4;
   if (g.maxPositions !== void 0) s.maxPositions = g.maxPositions;
   if (g.guard !== void 0) s.guard = g.guard;
+  if (g.minAdx !== void 0) s.minAdx = g.minAdx;
   return s;
 }
 function save(s) {
@@ -33367,7 +33410,8 @@ async function scan({ symbols = HL_UNIVERSE, bars = 300 } = {}) {
             price: key ? Number(mids[key]) : price,
             trendUp: ma50 ? price > ma50 : null,
             atrPct: a?.summary?.atrPct ?? null,
-            rsi: a?.summary?.rsi14 ?? null
+            rsi: a?.summary?.rsi14 ?? null,
+            adx: a?.summary?.adx ?? null
           });
         } catch (e) {
           errors.push(`${sym}: ${e.message}`);
@@ -33507,6 +33551,18 @@ async function runCycleInner({ dryRun = true, scanResult = null } = {}) {
     if (cd && Date.now() - cd < CFG.cooldownMin * 6e4) {
       const left = Math.ceil((CFG.cooldownMin * 6e4 - (Date.now() - cd)) / 6e4);
       actions.push({ coin, action: "SKIP", reason: `\u06A9\u0648\u0644\u200C\u062F\u0627\u0648\u0646 \u0628\u0639\u062F \u0627\u0632 \u062E\u0631\u0648\u062C \xB7 ${left} \u062F\u0642\u06CC\u0642\u0647 \u0645\u0627\u0646\u062F\u0647` });
+      continue;
+    }
+    const adxNow = r.adx === null || r.adx === void 0 ? null : Number(r.adx);
+    if (adxNow === null || adxNow < minAdxOf(st)) {
+      const nearSignal = r.score >= CFG.minScore && r.trendUp === true || CFG.allowShort && r.score <= -CFG.shortScore && r.trendUp === false && (r.rsi ?? 100) < CFG.rsiMax;
+      if (nearSignal) {
+        actions.push({
+          coin,
+          action: "SKIP",
+          reason: `\u0631\u0648\u0646\u062F \u0646\u0627\u0645\u0634\u062E\u0635 \xB7 ADX ${adxNow === null ? "\u2014" : adxNow.toFixed(0)} < ${minAdxOf(st)}`
+        });
+      }
       continue;
     }
     if (r.score >= CFG.minScore && r.trendUp === true) {
@@ -33729,6 +33785,18 @@ async function checkPnlGuard() {
   });
   return { triggered: true, upnl, limit, guard: g, closed: r.closed };
 }
+function minAdxOf(stArg) {
+  const s = stArg || load();
+  const v = Number(s.minAdx);
+  return Number.isFinite(v) && v >= 0 ? Math.min(60, Math.round(v)) : CFG.minAdx;
+}
+async function setMinAdx(n2) {
+  const raw = Number(n2);
+  if (!Number.isFinite(raw)) throw new Error("\u0639\u062F\u062F \u0646\u0627\u0645\u0639\u062A\u0628\u0631");
+  const v = Math.max(0, Math.min(60, Math.round(raw)));
+  saveSettings({ minAdx: v });
+  return { minAdx: v, source: "settings" };
+}
 function maxPosOf(stArg) {
   const s = stArg || load();
   const v = Number(s.maxPositions);
@@ -33771,7 +33839,7 @@ async function publicState() {
   const top = Object.entries(scores).map(([coin, score]) => ({ coin, score })).sort((a, b2) => b2.score - a.score).slice(0, 5);
   const recent = (st.log || []).slice(-1).flatMap((l) => (l.actions || []).slice(0, 6)).reverse();
   return {
-    cfg: { live: hlConfig().liveConfirm, minScore: CFG.minScore, maxPositions: maxPosOf(), notional: CFG.notionalUsd, leverage: CFG.leverage, slPct: CFG.slPct, tpPct: CFG.tpPct },
+    cfg: { live: hlConfig().liveConfirm, minScore: CFG.minScore, maxPositions: maxPosOf(), minAdx: minAdxOf(st), notional: CFG.notionalUsd, leverage: CFG.leverage, slPct: CFG.slPct, tpPct: CFG.tpPct },
     lastScanAt: st.lastScanAt || 0,
     lastCycleAt: st.lastCycleAt || 0,
     autorun: String(process.env.HL_AUTORUN || "") === "1",
@@ -33850,6 +33918,7 @@ var HL_PAGE = [
   `h+='<div class="r"><span class="k">\u06AF\u0627\u0631\u062F '+gd.pct+'\u066A \u0633\u0648\u062F/\u0632\u06CC\u0627\u0646 \u0628\u0627\u0632</span><span class="v" style="color:'+(gd.enabled?"#34d399":"#7d8ca3")+'">'+(gd.enabled?"\u0631\u0648\u0634\u0646":"\u062E\u0627\u0645\u0648\u0634")+'</span></div>';`,
   `h+='<div class="r"><span class="k">\u0622\u0633\u062A\u0627\u0646\u0647</span><span class="v" style="display:flex;align-items:center;gap:10px"><button onclick="setPct(-5)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">\u2212</button><b>'+gd.pct+'\u066A</b><button onclick="setPct(5)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">+</button></span></div>';`,
   `h+='<div class="r"><span class="k">\u062D\u062F\u0627\u06A9\u062B\u0631 \u067E\u0648\u0632\u06CC\u0634\u0646 \u0628\u0627\u0632</span><span class="v" style="display:flex;align-items:center;gap:10px"><button onclick="setMaxPos(-1)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">\u2212</button><b>'+(d.cfg.maxPositions)+'</b><button onclick="setMaxPos(1)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">+</button></span></div>';`,
+  `h+='<div class="r"><span class="k">\u062D\u062F\u0627\u0642\u0644 ADX (\u062A\u0634\u062E\u06CC\u0635 \u0631\u0648\u0646\u062F)</span><span class="v" style="display:flex;align-items:center;gap:10px"><button onclick="setAdx(-5)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">\u2212</button><b>'+(d.cfg.minAdx===undefined?25:d.cfg.minAdx)+'</b><button onclick="setAdx(5)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">+</button></span></div>';`,
   `h+='<div style="padding-top:8px"><button onclick="toggleGuard()" style="width:100%;padding:11px;font-size:13px;font-weight:700;border-radius:11px;font-family:inherit;background:'+(gd.enabled?"#12301f":"#1a2334")+';color:'+(gd.enabled?"#34d399":"#8fa0b8")+';border:1px solid '+(gd.enabled?"#1f6b4a":"#243349")+'">'+(gd.enabled?"\u06AF\u0627\u0631\u062F \u0631\u0648\u0634\u0646 \u0627\u0633\u062A \u2014 \u0628\u0631\u0627\u06CC \u062E\u0627\u0645\u0648\u0634 \u06A9\u0631\u062F\u0646 \u0628\u0632\u0646":"\u06AF\u0627\u0631\u062F \u062E\u0627\u0645\u0648\u0634 \u0627\u0633\u062A \u2014 \u0628\u0631\u0627\u06CC \u0631\u0648\u0634\u0646 \u06A9\u0631\u062F\u0646 \u0628\u0632\u0646")+'</button></div>';`,
   `h+='<div class="r"><span class="k">\u067E\u0648\u0632\u06CC\u0634\u0646 \u0628\u0627\u0632</span><span class="v">'+d.positions.length+" \u0627\u0632 "+d.cfg.maxPositions+'</span></div></div>';`,
   // پوزیشن‌ها
@@ -33875,7 +33944,7 @@ var HL_PAGE = [
   `h+='<div class="c"><div class="t">\u0622\u062E\u0631\u06CC\u0646 \u0627\u0642\u062F\u0627\u0645\u200C\u0647\u0627</div><div class="log">';`,
   'for(const a of d.recent)h+=a.coin+" \xB7 "+a.action+" \xB7 "+(a.reason||"")+"<br>";',
   'h+="</div></div>";}',
-  "window.__mp=(d.cfg&&d.cfg.maxPositions)||3;window.__gd=d.guard||{enabled:false,pct:5};",
+  "window.__mp=(d.cfg&&d.cfg.maxPositions)||3;window.__adx=(d.cfg&&d.cfg.minAdx);window.__gd=d.guard||{enabled:false,pct:5};",
   'document.getElementById("app").innerHTML=h;',
   'var bb=document.getElementById("btnAll");bb.style.display=d.positions.length?"block":"none";}',
   'async function tick(){try{const r=await fetch("/api/hl/public/state");render(await r.json())}catch(e){}}',
@@ -33910,6 +33979,10 @@ var HL_PAGE = [
   'var t=coin+" \u0628\u0633\u062A\u0647 \u0634\u062F"+(x.pnl!=null?(" \xB7 "+(x.pnl>=0?"+":"\\u2212")+"$"+Math.abs(x.pnl).toFixed(2)):"")+(x.locked?" \xB7 \u0642\u0641\u0644 \u0634\u062F":" \xB7 \u0628\u062F\u0648\u0646 \u0642\u0641\u0644")+(d.rescan?" \xB7 \u0628\u0631\u0631\u0633\u06CC \u0628\u0627\u0632\u0627\u0631\u2026":"");',
   'msg(t,x.ok?"#34d399":"#f0596b");setTimeout(tick,1200);',
   '}).catch(function(){msg("\u062E\u0637\u0627\u06CC \u0634\u0628\u06A9\u0647","#f0596b");b.textContent="\u0628\u0633\u062A\u0646";b.disabled=false})}',
+  "function setAdx(delta){var n=Math.max(0,Math.min(60,Number(window.__adx||25)+delta));",
+  'fetch("/api/hl/public/minadx",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({n:n})})',
+  '.then(function(r){return r.json()}).then(function(d){if(d.ok){window.__adx=d.minAdx;msg("\u062D\u062F\u0627\u0642\u0644 ADX \u0634\u062F "+d.minAdx,"#34d399");setTimeout(tick,400)}else{msg("\u062E\u0637\u0627: "+(d.error||"?"),"#f0596b")}})',
+  '.catch(function(){msg("\u062E\u0637\u0627\u06CC \u0634\u0628\u06A9\u0647","#f0596b")})}',
   "function setMaxPos(delta){var n=Math.max(1,Math.min(6,Number((window.__gd&&window.__gd.mp)||window.__mp||3)+delta));",
   'fetch("/api/hl/public/maxpos",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({n:n})})',
   '.then(function(r){return r.json()}).then(function(d){if(d.ok){window.__mp=d.maxPositions;msg("\u0633\u0642\u0641 \u067E\u0648\u0632\u06CC\u0634\u0646 \u0634\u062F "+d.maxPositions,"#34d399");setTimeout(tick,400)}else{msg("\u062E\u0637\u0627: "+(d.error||"?"),"#f0596b")}})',
@@ -35220,6 +35293,7 @@ function isAuthorized(req, url) {
   if (url.pathname === "/api/hl/public/close-one") return true;
   if (url.pathname === "/api/hl/public/guard") return true;
   if (url.pathname === "/api/hl/public/maxpos") return true;
+  if (url.pathname === "/api/hl/public/minadx") return true;
   if (!url.pathname.startsWith("/api/")) return true;
   const header = req.headers["x-app-password"];
   if (header && header === APP_PASSWORD) return true;
@@ -35332,6 +35406,11 @@ var server = http2.createServer(async (req, res) => {
         });
       }
       return sendJson(res, 200, { ok: true, rescan: true, ...r });
+    }
+    if (req.method === "POST" && pathname === "/api/hl/public/minadx") {
+      const body = await readJsonBody(req);
+      const r = await setMinAdx(body?.n ?? body?.minAdx);
+      return sendJson(res, 200, { ok: true, ...r });
     }
     if (req.method === "POST" && pathname === "/api/hl/public/maxpos") {
       const body = await readJsonBody(req);
