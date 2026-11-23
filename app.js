@@ -33297,9 +33297,11 @@ var CFG = {
 var STATE_FILE2 = process.env.HL_STATE_FILE || path3.join(process.cwd(), "data", "hl-state.json");
 function load() {
   try {
-    return JSON.parse(fs3.readFileSync(STATE_FILE2, "utf8"));
+    const s = JSON.parse(fs3.readFileSync(STATE_FILE2, "utf8"));
+    if (s.maxPositions === void 0) s.maxPositions = 2;
+    return s;
   } catch {
-    return { trades: [], log: [], lastScanAt: 0, scores: {} };
+    return { trades: [], log: [], lastScanAt: 0, scores: {}, maxPositions: 2 };
   }
 }
 function save(s) {
@@ -33470,7 +33472,7 @@ async function runCycleInner({ dryRun = true, scanResult = null } = {}) {
       }
     }
   }
-  const free = CFG.maxPositions - positions.length;
+  const free = maxPosOf() - positions.length;
   const scanData = scanResult || await scan();
   const acc = await getAccount2();
   const equity = acc.equity;
@@ -33495,8 +33497,8 @@ async function runCycleInner({ dryRun = true, scanResult = null } = {}) {
   candidates.sort((a, b2) => (b2.side === "short" ? Math.abs(b2.score) : b2.score) - (a.side === "short" ? Math.abs(a.score) : a.score));
   for (const c of candidates) {
     const openCount = positions.length + actions.filter((a) => a.action === "OPEN" || a.action === "OPEN(dry)").length;
-    if (openCount >= CFG.maxPositions) {
-      actions.push({ coin: c.coin, action: "SKIP", reason: `\u0633\u0642\u0641 ${CFG.maxPositions} \u067E\u0648\u0632\u06CC\u0634\u0646 \u067E\u0631 \u0627\u0633\u062A` });
+    if (openCount >= maxPosOf()) {
+      actions.push({ coin: c.coin, action: "SKIP", reason: `\u0633\u0642\u0641 ${maxPosOf()} \u067E\u0648\u0632\u06CC\u0634\u0646 \u067E\u0631 \u0627\u0633\u062A` });
       continue;
     }
     const { universe: uni } = await getMeta();
@@ -33704,6 +33706,20 @@ async function checkPnlGuard() {
   });
   return { triggered: true, upnl, limit, guard: g, closed: r.closed };
 }
+function maxPosOf(stArg) {
+  const s = stArg || load();
+  const v = Number(s.maxPositions);
+  return Number.isFinite(v) && v >= 1 ? Math.min(6, Math.round(v)) : CFG.maxPositions;
+}
+async function setMaxPositions(n2) {
+  const raw = Number(n2);
+  if (!Number.isFinite(raw)) throw new Error("\u0639\u062F\u062F \u0646\u0627\u0645\u0639\u062A\u0628\u0631");
+  const v = Math.max(1, Math.min(6, Math.round(raw)));
+  const st = load();
+  st.maxPositions = v;
+  save(st);
+  return { maxPositions: maxPosOf(st), source: "state" };
+}
 async function publicState() {
   const st = load();
   let positions = [];
@@ -33734,7 +33750,7 @@ async function publicState() {
   const top = Object.entries(scores).map(([coin, score]) => ({ coin, score })).sort((a, b2) => b2.score - a.score).slice(0, 5);
   const recent = (st.log || []).slice(-1).flatMap((l) => (l.actions || []).slice(0, 6)).reverse();
   return {
-    cfg: { live: hlConfig().liveConfirm, minScore: CFG.minScore, maxPositions: CFG.maxPositions, notional: CFG.notionalUsd, leverage: CFG.leverage, slPct: CFG.slPct, tpPct: CFG.tpPct },
+    cfg: { live: hlConfig().liveConfirm, minScore: CFG.minScore, maxPositions: maxPosOf(), notional: CFG.notionalUsd, leverage: CFG.leverage, slPct: CFG.slPct, tpPct: CFG.tpPct },
     lastScanAt: st.lastScanAt || 0,
     lastCycleAt: st.lastCycleAt || 0,
     autorun: String(process.env.HL_AUTORUN || "") === "1",
@@ -33812,6 +33828,7 @@ var HL_PAGE = [
   "var gd=d.guard||{enabled:false,pct:5};",
   `h+='<div class="r"><span class="k">\u06AF\u0627\u0631\u062F '+gd.pct+'\u066A \u0633\u0648\u062F/\u0632\u06CC\u0627\u0646 \u0628\u0627\u0632</span><span class="v" style="color:'+(gd.enabled?"#34d399":"#7d8ca3")+'">'+(gd.enabled?"\u0631\u0648\u0634\u0646":"\u062E\u0627\u0645\u0648\u0634")+'</span></div>';`,
   `h+='<div class="r"><span class="k">\u0622\u0633\u062A\u0627\u0646\u0647</span><span class="v" style="display:flex;align-items:center;gap:10px"><button onclick="setPct(-5)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">\u2212</button><b>'+gd.pct+'\u066A</b><button onclick="setPct(5)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">+</button></span></div>';`,
+  `h+='<div class="r"><span class="k">\u062D\u062F\u0627\u06A9\u062B\u0631 \u067E\u0648\u0632\u06CC\u0634\u0646 \u0628\u0627\u0632</span><span class="v" style="display:flex;align-items:center;gap:10px"><button onclick="setMaxPos(-1)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">\u2212</button><b>'+(d.cfg.maxPositions)+'</b><button onclick="setMaxPos(1)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">+</button></span></div>';`,
   `h+='<div style="padding-top:8px"><button onclick="toggleGuard()" style="width:100%;padding:11px;font-size:13px;font-weight:700;border-radius:11px;font-family:inherit;background:'+(gd.enabled?"#12301f":"#1a2334")+';color:'+(gd.enabled?"#34d399":"#8fa0b8")+';border:1px solid '+(gd.enabled?"#1f6b4a":"#243349")+'">'+(gd.enabled?"\u06AF\u0627\u0631\u062F \u0631\u0648\u0634\u0646 \u0627\u0633\u062A \u2014 \u0628\u0631\u0627\u06CC \u062E\u0627\u0645\u0648\u0634 \u06A9\u0631\u062F\u0646 \u0628\u0632\u0646":"\u06AF\u0627\u0631\u062F \u062E\u0627\u0645\u0648\u0634 \u0627\u0633\u062A \u2014 \u0628\u0631\u0627\u06CC \u0631\u0648\u0634\u0646 \u06A9\u0631\u062F\u0646 \u0628\u0632\u0646")+'</button></div>';`,
   `h+='<div class="r"><span class="k">\u067E\u0648\u0632\u06CC\u0634\u0646 \u0628\u0627\u0632</span><span class="v">'+d.positions.length+" \u0627\u0632 "+d.cfg.maxPositions+'</span></div></div>';`,
   // پوزیشن‌ها
@@ -33837,7 +33854,7 @@ var HL_PAGE = [
   `h+='<div class="c"><div class="t">\u0622\u062E\u0631\u06CC\u0646 \u0627\u0642\u062F\u0627\u0645\u200C\u0647\u0627</div><div class="log">';`,
   'for(const a of d.recent)h+=a.coin+" \xB7 "+a.action+" \xB7 "+(a.reason||"")+"<br>";',
   'h+="</div></div>";}',
-  "window.__gd=d.guard||{enabled:false,pct:5};",
+  "window.__mp=(d.cfg&&d.cfg.maxPositions)||3;window.__gd=d.guard||{enabled:false,pct:5};",
   'document.getElementById("app").innerHTML=h;',
   'var bb=document.getElementById("btnAll");bb.style.display=d.positions.length?"block":"none";}',
   'async function tick(){try{const r=await fetch("/api/hl/public/state");render(await r.json())}catch(e){}}',
@@ -33872,6 +33889,10 @@ var HL_PAGE = [
   'var t=coin+" \u0628\u0633\u062A\u0647 \u0634\u062F"+(x.pnl!=null?(" \xB7 "+(x.pnl>=0?"+":"\\u2212")+"$"+Math.abs(x.pnl).toFixed(2)):"")+(x.locked?" \xB7 \u0642\u0641\u0644 \u0634\u062F":" \xB7 \u0628\u062F\u0648\u0646 \u0642\u0641\u0644")+(d.rescan?" \xB7 \u0628\u0631\u0631\u0633\u06CC \u0628\u0627\u0632\u0627\u0631\u2026":"");',
   'msg(t,x.ok?"#34d399":"#f0596b");setTimeout(tick,1200);',
   '}).catch(function(){msg("\u062E\u0637\u0627\u06CC \u0634\u0628\u06A9\u0647","#f0596b");b.textContent="\u0628\u0633\u062A\u0646";b.disabled=false})}',
+  "function setMaxPos(delta){var n=Math.max(1,Math.min(6,Number((window.__gd&&window.__gd.mp)||window.__mp||3)+delta));",
+  'fetch("/api/hl/public/maxpos",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({n:n})})',
+  '.then(function(r){return r.json()}).then(function(d){if(d.ok){window.__mp=d.maxPositions;msg("\u0633\u0642\u0641 \u067E\u0648\u0632\u06CC\u0634\u0646 \u0634\u062F "+d.maxPositions,"#34d399");setTimeout(tick,400)}else{msg("\u062E\u0637\u0627: "+(d.error||"?"),"#f0596b")}})',
+  '.catch(function(){msg("\u062E\u0637\u0627\u06CC \u0634\u0628\u06A9\u0647","#f0596b")})}',
   "function setPct(delta){var gd=window.__gd||{enabled:true,pct:10};var p=Math.max(2,Math.min(50,Number(gd.pct)+delta));",
   'fetch("/api/hl/public/guard",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({pct:p})})',
   '.then(function(r){return r.json()}).then(function(d){if(d.ok){msg("\u0622\u0633\u062A\u0627\u0646\u0647 \u0634\u062F "+d.guard.pct+"\u066A","#34d399");setTimeout(tick,400)}else{msg("\u062E\u0637\u0627: "+(d.error||"?"),"#f0596b")}})',
@@ -35177,6 +35198,7 @@ function isAuthorized(req, url) {
   if (url.pathname === "/api/hl/public/close-all") return true;
   if (url.pathname === "/api/hl/public/close-one") return true;
   if (url.pathname === "/api/hl/public/guard") return true;
+  if (url.pathname === "/api/hl/public/maxpos") return true;
   if (!url.pathname.startsWith("/api/")) return true;
   const header = req.headers["x-app-password"];
   if (header && header === APP_PASSWORD) return true;
@@ -35289,6 +35311,11 @@ var server = http2.createServer(async (req, res) => {
         });
       }
       return sendJson(res, 200, { ok: true, rescan: true, ...r });
+    }
+    if (req.method === "POST" && pathname === "/api/hl/public/maxpos") {
+      const body = await readJsonBody(req);
+      const r = await setMaxPositions(body?.n ?? body?.maxPositions);
+      return sendJson(res, 200, { ok: true, ...r });
     }
     if (req.method === "POST" && pathname === "/api/hl/public/guard") {
       const body = await readJsonBody(req);
