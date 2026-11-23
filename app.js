@@ -33279,7 +33279,7 @@ var CFG = {
   leverage: Number(process.env.HL_LEVERAGE || 5),
   slPct: Number(process.env.HL_SL_PCT || 5),
   tpPct: Number(process.env.HL_TP_PCT || 8),
-  maxPositions: Number(process.env.HL_MAX_POSITIONS || 3),
+  maxPositions: Number(process.env.HL_MAX_POSITIONS || 4),
   maxHoldBars: Number(process.env.HL_MAX_HOLD_BARS || 48),
   marginCapPct: Number(process.env.HL_MARGIN_CAP_PCT || 95),
   // حداکثر درصد سرمایه در مارجین
@@ -33295,14 +33295,35 @@ var CFG = {
   // شرط RSI برای شورت
 };
 var STATE_FILE2 = process.env.HL_STATE_FILE || path3.join(process.cwd(), "data", "hl-state.json");
-function load() {
+var SETTINGS_FILE = process.env.HL_SETTINGS_FILE || path3.join(path3.dirname(STATE_FILE2), "hl-settings.json");
+function loadSettings() {
   try {
-    const s = JSON.parse(fs3.readFileSync(STATE_FILE2, "utf8"));
-    if (s.maxPositions === void 0) s.maxPositions = 2;
-    return s;
+    return JSON.parse(fs3.readFileSync(SETTINGS_FILE, "utf8"));
   } catch {
-    return { trades: [], log: [], lastScanAt: 0, scores: {}, maxPositions: 2 };
+    return {};
   }
+}
+function saveSettings(patch) {
+  const next = { ...loadSettings(), ...patch };
+  try {
+    fs3.mkdirSync(path3.dirname(SETTINGS_FILE), { recursive: true });
+    fs3.writeFileSync(SETTINGS_FILE, JSON.stringify(next, null, 1));
+  } catch {
+  }
+  return next;
+}
+function load() {
+  let s;
+  try {
+    s = JSON.parse(fs3.readFileSync(STATE_FILE2, "utf8"));
+  } catch {
+    s = { trades: [], log: [], lastScanAt: 0, scores: {} };
+  }
+  const g = loadSettings();
+  if (s.maxPositions === void 0 && g.maxPositions === void 0) s.maxPositions = 4;
+  if (g.maxPositions !== void 0) s.maxPositions = g.maxPositions;
+  if (g.guard !== void 0) s.guard = g.guard;
+  return s;
 }
 function save(s) {
   try {
@@ -33685,12 +33706,14 @@ function guardOf(st) {
 async function setGuard(patch = {}) {
   const st = load();
   const cur = guardOf(st);
-  st.guard = {
+  const guard = {
     enabled: patch.enabled === void 0 ? cur.enabled : Boolean(patch.enabled),
     pct: patch.pct === void 0 ? cur.pct : Math.max(0.5, Math.min(50, Number(patch.pct)))
   };
+  saveSettings({ guard });
+  st.guard = guard;
   save(st);
-  return st.guard;
+  return guard;
 }
 async function checkPnlGuard() {
   const st = load();
@@ -33715,10 +33738,8 @@ async function setMaxPositions(n2) {
   const raw = Number(n2);
   if (!Number.isFinite(raw)) throw new Error("\u0639\u062F\u062F \u0646\u0627\u0645\u0639\u062A\u0628\u0631");
   const v = Math.max(1, Math.min(6, Math.round(raw)));
-  const st = load();
-  st.maxPositions = v;
-  save(st);
-  return { maxPositions: maxPosOf(st), source: "state" };
+  saveSettings({ maxPositions: v });
+  return { maxPositions: v, source: "settings" };
 }
 async function publicState() {
   const st = load();
