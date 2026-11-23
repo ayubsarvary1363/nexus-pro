@@ -8874,6 +8874,192 @@ async function testRemoteSync(state) {
   }
 }
 
+// server/newsService.js
+var FEEDS = [
+  { name: "CoinDesk", url: "https://www.coindesk.com/arc/outboundfeeds/rss/?outputType=xml" },
+  { name: "Cointelegraph", url: "https://cointelegraph.com/rss" },
+  { name: "The Block", url: "https://www.theblock.co/rss.xml" },
+  { name: "Decrypt", url: "https://decrypt.co/feed" },
+  { name: "CryptoSlate", url: "https://cryptoslate.com/feed/" }
+];
+var COIN_WORDS = {
+  BTC: ["bitcoin", "btc"],
+  ETH: ["ethereum", "ether", "eth "],
+  SOL: ["solana", "sol "],
+  XRP: ["xrp", "ripple"],
+  BNB: ["bnb", "binance coin"],
+  ADA: ["cardano", "ada "],
+  DOGE: ["dogecoin", "doge"],
+  DOT: ["polkadot"],
+  LINK: ["chainlink"],
+  AVAX: ["avalanche"],
+  LTC: ["litecoin"],
+  NEAR: ["near protocol"],
+  SUI: ["sui "],
+  BCH: ["bitcoin cash"],
+  APT: ["aptos"],
+  TRX: ["tron", "trx"],
+  XLM: ["stellar", "xlm"],
+  INJ: ["injective"],
+  ARB: ["arbitrum"],
+  AAVE: ["aave"],
+  UNI: ["uniswap"],
+  ZEC: ["zcash"],
+  XMR: ["monero"],
+  HYPE: ["hyperliquid"],
+  ENA: ["ethena"],
+  PAXG: ["pax gold", "paxg"],
+  WLD: ["worldcoin", "world network"],
+  STRK: ["starknet"],
+  ZRO: ["layerzero"],
+  TAO: ["bittensor"],
+  JUP: ["jupiter exchange", "jupiter dao"],
+  LIT: ["litentry"],
+  kPEPE: ["pepe"],
+  ONDO: ["ondo finance", "ondo "],
+  CRV: ["curve finance", "curve dao"]
+};
+var SHOCK = [
+  /\b(exchange|bridge|protocol)\b[\s\S]{0,30}\b(hacked|exploited|drained)\b/i,
+  /\bhalts?\s+(all\s+)?withdrawals?\b/i,
+  /\b(sec|regulators?|doj)\s+(sue|sues|sued|charges|charged|bans|banned)\b/i,
+  /\b(declares?\s+bankruptcy|files?\s+for\s+bankruptcy|insolven(cy|t))\b/i,
+  /\bstablecoin\b[\s\S]{0,25}\b(depegs?|collapses?)\b/i,
+  /\bmarket\s+(crash|crashes|plunge|plunges|sell-?off)\b/i,
+  /\b(war|invasion|nuclear strike|martial law)\b/i,
+  /\bbans?\s+(crypto|trading)\b/i
+];
+var NEGATIVE = [
+  /\b(hacked|hack|exploited|exploit|drained|breach)\b/i,
+  /\b(delist|delisted|delisting)\b/i,
+  /\b(suspend|suspended|halts?|halted)\b/i,
+  /\b(outage|freeze|frozen|glitch)\b/i,
+  /\b(depeg|depegs|depegged)\b/i,
+  /\b(fraud|scam|rug ?pull|lawsuit|sues|sued|charges|charged)\b/i,
+  /\b(bankrupt|insolven)\w*\b/i
+];
+var NEUTRALIZERS = [
+  /\b(recover|recovers|recovered|recovery)\b/i,
+  /\b(stolen|loot|past|historical)\b/i,
+  /\b(settles?|settled|fined|penalty)\b/i,
+  /\b(20(21|22|23|24))\b/,
+  /\b(explainer|opinion|analysis|what to know)\b/i
+];
+var POSITIVE = [
+  /\b(list(s|ed|ing)?|approv\w*|partner\w*|upgrade\w*)\b/i,
+  /\b(buyback|burn|launch\w*|mainnet|integrat\w*)\b/i,
+  /\b(etf|rally|rallies|surge|surges|soar|soars|record high)\b/i
+];
+var cache = {
+  items: [],
+  at: 0,
+  errors: [],
+  sourceErrors: [],
+  lastRefreshMs: 0
+};
+var TTL_MS = 5 * 60 * 1e3;
+var MAX_ITEMS = 120;
+function stripTags(s = "") {
+  return String(s).replace(/<!\[CDATA\[|\]\]>/g, "").replace(/<[^>]+>/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'").replace(/&nbsp;/g, " ").replace(/\s+/g, " ").trim();
+}
+function parseFeed(xml, source) {
+  const out = [];
+  const blocks = xml.match(/<item[\s\S]*?<\/item>/gi) || xml.match(/<entry[\s\S]*?<\/entry>/gi) || [];
+  for (const b2 of blocks.slice(0, 25)) {
+    const title = stripTags((b2.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1] || "");
+    if (!title || title.length < 12) continue;
+    const link = stripTags((b2.match(/<link[^>]*>([\s\S]*?)<\/link>/i) || [])[1] || "");
+    const dateRaw = (b2.match(/<pubDate[^>]*>([\s\S]*?)<\/pubDate>/i) || [])[1] || (b2.match(/<published[^>]*>([\s\S]*?)<\/published>/i) || [])[1] || (b2.match(/<updated[^>]*>([\s\S]*?)<\/updated>/i) || [])[1] || "";
+    const t = Date.parse(stripTags(dateRaw));
+    out.push({ title, link, source, at: Number.isFinite(t) ? t : Date.now() });
+  }
+  return out;
+}
+function coinsIn(text) {
+  const low = ` ${text.toLowerCase()} `;
+  const hits = [];
+  for (const [coin, words7] of Object.entries(COIN_WORDS)) {
+    if (words7.some((w) => low.includes(w))) hits.push(coin);
+  }
+  return hits;
+}
+function classifyNews(item) {
+  const t = item.title;
+  const coins = coinsIn(t);
+  const inert = NEUTRALIZERS.some((re) => re.test(t));
+  let impact = null;
+  if (SHOCK.some((re) => re.test(t))) impact = "shock";
+  else if (!inert && NEGATIVE.some((re) => re.test(t))) impact = "negative";
+  else if (POSITIVE.some((re) => re.test(t))) impact = "positive";
+  return { ...item, coins, impact, inert };
+}
+async function refreshNews({ force = false } = {}) {
+  const now = Date.now();
+  if (!force && now - cache.at < TTL_MS) return newsState();
+  const errors = [];
+  const all = [];
+  await Promise.all(
+    FEEDS.map(async (f2) => {
+      try {
+        const r = await fetch(f2.url, {
+          headers: { "User-Agent": "Mozilla/5.0 (compatible; NexusNews/1.0)", Accept: "application/rss+xml, application/xml" },
+          signal: AbortSignal.timeout(12e3)
+        });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const xml = await r.text();
+        all.push(...parseFeed(xml, f2.name));
+      } catch (e) {
+        errors.push(`${f2.name}: ${e.message}`);
+      }
+    })
+  );
+  const seen = /* @__PURE__ */ new Set();
+  const items = all.sort((a, b2) => b2.at - a.at).filter((it) => {
+    const k = it.title.toLowerCase().slice(0, 60);
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  }).slice(0, MAX_ITEMS).map(classifyNews);
+  cache.items = items;
+  cache.at = now;
+  cache.lastRefreshMs = Date.now() - now;
+  cache.sourceErrors = errors;
+  return newsState();
+}
+function newsState({ blockHours = 12, shockHours = 3 } = {}) {
+  const now = Date.now();
+  const fresh = cache.items.filter((i) => now - i.at < blockHours * 36e5);
+  const shocks = fresh.filter((i) => i.impact === "shock" && now - i.at < shockHours * 36e5);
+  const blocked = {};
+  for (const i of fresh) {
+    if (i.impact !== "negative" || i.inert) continue;
+    if (Object.keys(blocked).length >= 3) break;
+    const head = i.title.slice(0, 100).toLowerCase();
+    for (const c of i.coins) {
+      const words7 = COIN_WORDS[c] || [];
+      if (!words7.some((w) => head.includes(w))) continue;
+      if (!blocked[c]) blocked[c] = { title: i.title, source: i.source, at: i.at };
+    }
+  }
+  return {
+    updatedAt: cache.at,
+    ageSec: cache.at ? Math.round((now - cache.at) / 1e3) : null,
+    count: fresh.length,
+    sourceErrors: cache.sourceErrors,
+    globalShock: shocks.length ? { count: shocks.length, headlines: shocks.slice(0, 2).map((s) => ({ title: s.title, source: s.source, at: s.at })) } : null,
+    blocked,
+    latest: cache.items.slice(0, 6).map((i) => ({
+      title: i.title,
+      source: i.source,
+      at: i.at,
+      impact: i.impact,
+      coins: i.coins
+    })),
+    blockHours,
+    shockHours
+  };
+}
+
 // server/walletService.js
 import fs2 from "fs";
 import path2 from "path";
@@ -33289,6 +33475,10 @@ async function setLeverage({ coin, leverage = LEVERAGE, cross = true, dryRun = f
   if (idx < 0) throw new Error(`${coin} \u0631\u0648\u06CC Hyperliquid \u0646\u06CC\u0633\u062A`);
   return exchange({ type: "updateLeverage", asset: idx, isCross: cross, leverage }, { dryRun });
 }
+async function closePosition({ coin, size, dryRun = false }) {
+  const side = size < 0;
+  return marketOrder({ coin, isBuy: side, size: Math.abs(size), reduceOnly: true, dryRun });
+}
 async function cancelOrders(oids = [], { dryRun = false } = {}) {
   if (!oids.length) return { skipped: true };
   const { universe } = await getMeta();
@@ -33366,6 +33556,9 @@ function load() {
   if (g.maxPositions !== void 0) s.maxPositions = g.maxPositions;
   if (g.guard !== void 0) s.guard = g.guard;
   if (g.minAdx !== void 0) s.minAdx = g.minAdx;
+  if (g.newsFilter !== void 0) s.newsFilter = g.newsFilter;
+  if (g.newsBlockHours !== void 0) s.newsBlockHours = g.newsBlockHours;
+  if (g.newsShockHours !== void 0) s.newsShockHours = g.newsShockHours;
   return s;
 }
 function save(s) {
@@ -33543,6 +33736,16 @@ async function runCycleInner({ dryRun = true, scanResult = null } = {}) {
   const equity = acc.equity;
   let usedMargin = Number(acc.marginUsed || 0);
   let freeMarginAvail = Number(acc.freeMargin ?? Math.max(0, acc.spotUsdc - usedMargin));
+  const newsCfg = newsCfgOf(st);
+  let news = null;
+  if (newsCfg.enabled) {
+    try {
+      await refreshNews();
+      news = newsState({ blockHours: newsCfg.blockHours, shockHours: newsCfg.shockHours });
+    } catch (e) {
+      news = null;
+    }
+  }
   const candidates = [];
   for (const r of scanData.rows || []) {
     const coin = r.coin.toUpperCase();
@@ -33553,9 +33756,19 @@ async function runCycleInner({ dryRun = true, scanResult = null } = {}) {
       actions.push({ coin, action: "SKIP", reason: `\u06A9\u0648\u0644\u200C\u062F\u0627\u0648\u0646 \u0628\u0639\u062F \u0627\u0632 \u062E\u0631\u0648\u062C \xB7 ${left} \u062F\u0642\u06CC\u0642\u0647 \u0645\u0627\u0646\u062F\u0647` });
       continue;
     }
+    const nearSignal = r.score >= CFG.minScore && r.trendUp === true || CFG.allowShort && r.score <= -CFG.shortScore && r.trendUp === false && (r.rsi ?? 100) < CFG.rsiMax;
+    if (nearSignal && news && news.globalShock) {
+      const h = news.globalShock.headlines[0];
+      actions.push({ coin, action: "SKIP", reason: `\u062E\u0628\u0631 \u0628\u0627\u0632\u0627\u0631\u06AF\u0633\u062A\u0631 \xB7 ${String(h?.title || "").slice(0, 70)}` });
+      continue;
+    }
+    if (nearSignal && news && news.blocked && news.blocked[coin]) {
+      const b2 = news.blocked[coin];
+      actions.push({ coin, action: "SKIP", reason: `\u062E\u0628\u0631 \u0645\u0646\u0641\u06CC \xB7 ${String(b2.title).slice(0, 70)}` });
+      continue;
+    }
     const adxNow = r.adx === null || r.adx === void 0 ? null : Number(r.adx);
     if (adxNow === null || adxNow < minAdxOf(st)) {
-      const nearSignal = r.score >= CFG.minScore && r.trendUp === true || CFG.allowShort && r.score <= -CFG.shortScore && r.trendUp === false && (r.rsi ?? 100) < CFG.rsiMax;
       if (nearSignal) {
         actions.push({
           coin,
@@ -33752,6 +33965,69 @@ async function protectPosition({ coin, isShort, size, entry }, { attempts = 3 } 
   const ok = Boolean(s2 && closeEnough(s2, slPx) && t2 && closeEnough(t2, tpPx));
   return { ok, changed, sl: slPx, tp: tpPx, errors: errs };
 }
+async function closeMany(coins = null, { reason = "\u0628\u0633\u062A\u0646 \u062F\u0633\u062A\u06CC" } = {}) {
+  const acc = await getAccount2();
+  const st = load();
+  st.cooldown = st.cooldown || {};
+  const wanted = coins ? coins.map((c) => String(c).toUpperCase()) : null;
+  const closed = [];
+  for (const p of acc.positions) {
+    const coin = String(p.coin).toUpperCase();
+    if (wanted && !wanted.includes(coin)) continue;
+    const res = { coin, ok: false, pnl: Number(p.pnl || 0), locked: false };
+    try {
+      const oo = await openOrders(coin).catch(() => []);
+      if (oo.length) {
+        await cancelOrders(oo.map((o) => ({ a: o.assetIndex ?? 0, oid: o.oid }))).catch(() => {
+        });
+        await new Promise((r2) => setTimeout(r2, 500));
+      }
+      const r = await closePosition({ coin, size: p.size });
+      const status = r?.response?.data?.statuses?.[0];
+      if (status && status.error) throw new Error(status.error);
+      if (status === "error") throw new Error("\u0633\u0641\u0627\u0631\u0634 \u0627\u0632 \u0637\u0631\u0641 \u0635\u0631\u0627\u0641\u06CC \u0631\u062F \u0634\u062F");
+      res.ok = true;
+      if (res.pnl < 0) {
+        st.cooldown[coin] = Date.now();
+        res.locked = true;
+      }
+      const t = (st.trades || []).find((x) => x.status === "open" && String(x.coin).toUpperCase() === coin);
+      if (t) {
+        t.status = "closed";
+        t.closedAt = Date.now();
+        t.pnl = +Number(res.pnl || 0).toFixed(4);
+        t.closeReason = reason;
+      }
+    } catch (e) {
+      res.error = e.message;
+    }
+    closed.push(res);
+    await new Promise((r) => setTimeout(r, 700));
+  }
+  const okList = closed.filter((c) => c.ok);
+  if (okList.length) {
+    st.log = [
+      ...st.log || [],
+      {
+        at: Date.now(),
+        dryRun: false,
+        actions: okList.map((c) => ({
+          coin: c.coin,
+          action: "CLOSED",
+          reason: `${reason} \xB7 ${c.pnl >= 0 ? "+" : "\u2212"}$${Math.abs(c.pnl).toFixed(2)}${c.locked ? ` \xB7 ${CFG.cooldownMin} \u062F\u0642\u06CC\u0642\u0647 \u0642\u0641\u0644` : " \xB7 \u0628\u062F\u0648\u0646 \u0642\u0641\u0644"}`
+        }))
+      }
+    ].slice(-200);
+  }
+  save(st);
+  return { closed, reason };
+}
+async function closeAllPositions({ reason = "\u0628\u0633\u062A\u0646 \u0647\u0645\u0647" } = {}) {
+  return closeMany(null, { reason });
+}
+async function closeOnePosition(coin, { reason = "\u0628\u0633\u062A\u0646 \u062F\u0633\u062A\u06CC" } = {}) {
+  return closeMany([coin], { reason });
+}
 function guardOf(st) {
   const g = st.guard || {};
   return {
@@ -33784,6 +34060,24 @@ async function checkPnlGuard() {
     reason: `\u06AF\u0627\u0631\u062F ${g.pct}\u066A \xB7 \u0633\u0648\u062F/\u0632\u06CC\u0627\u0646 \u0628\u0627\u0632 ${upnl >= 0 ? "+" : "\u2212"}$${Math.abs(upnl).toFixed(2)}`
   });
   return { triggered: true, upnl, limit, guard: g, closed: r.closed };
+}
+function newsCfgOf(stArg) {
+  const st = stArg || load();
+  return {
+    enabled: st.newsFilter === void 0 ? String(process.env.HL_NEWS_FILTER || "1") !== "0" : Boolean(st.newsFilter),
+    blockHours: Number.isFinite(Number(st.newsBlockHours)) ? Number(st.newsBlockHours) : 12,
+    shockHours: Number.isFinite(Number(st.newsShockHours)) ? Number(st.newsShockHours) : 3
+  };
+}
+async function setNewsFilter(patch = {}) {
+  const cur = newsCfgOf();
+  const next = {
+    enabled: patch.enabled === void 0 ? cur.enabled : Boolean(patch.enabled),
+    blockHours: patch.blockHours === void 0 ? cur.blockHours : Math.max(1, Math.min(72, Math.round(Number(patch.blockHours)))),
+    shockHours: patch.shockHours === void 0 ? cur.shockHours : Math.max(1, Math.min(24, Math.round(Number(patch.shockHours))))
+  };
+  saveSettings({ newsFilter: next.enabled, newsBlockHours: next.blockHours, newsShockHours: next.shockHours });
+  return next;
 }
 function minAdxOf(stArg) {
   const s = stArg || load();
@@ -33837,9 +34131,24 @@ async function publicState() {
   }
   const scores = st.scores || {};
   const top = Object.entries(scores).map(([coin, score]) => ({ coin, score })).sort((a, b2) => b2.score - a.score).slice(0, 5);
+  let newsBox = null;
+  try {
+    const nc2 = newsCfgOf(st);
+    const ns = newsState({ blockHours: nc2.blockHours, shockHours: nc2.shockHours });
+    newsBox = {
+      enabled: nc2.enabled,
+      ageSec: ns.ageSec,
+      count: ns.count,
+      globalShock: ns.globalShock ? ns.globalShock.headlines[0].title : null,
+      blocked: Object.keys(ns.blocked || {}),
+      latest: (ns.latest || []).slice(0, 4)
+    };
+  } catch (e) {
+    newsBox = null;
+  }
   const recent = (st.log || []).slice(-1).flatMap((l) => (l.actions || []).slice(0, 6)).reverse();
   return {
-    cfg: { live: hlConfig().liveConfirm, minScore: CFG.minScore, maxPositions: maxPosOf(), minAdx: minAdxOf(st), notional: CFG.notionalUsd, leverage: CFG.leverage, slPct: CFG.slPct, tpPct: CFG.tpPct },
+    cfg: { live: hlConfig().liveConfirm, minScore: CFG.minScore, maxPositions: maxPosOf(), minAdx: minAdxOf(st), newsFilter: newsCfgOf(st).enabled, notional: CFG.notionalUsd, leverage: CFG.leverage, slPct: CFG.slPct, tpPct: CFG.tpPct },
     lastScanAt: st.lastScanAt || 0,
     lastCycleAt: st.lastCycleAt || 0,
     autorun: String(process.env.HL_AUTORUN || "") === "1",
@@ -33851,6 +34160,7 @@ async function publicState() {
     top,
     recent,
     guard: guardOf(st),
+    news: newsBox,
     openTrades: (st.trades || []).filter((t) => t.status === "open").length
   };
 }
@@ -33903,6 +34213,7 @@ var HL_PAGE = [
   'if(m<1)return "\u0647\u0645\u06CC\u0646 \u062D\u0627\u0644\u0627";if(m<60)return m+" \u062F\u0642\u06CC\u0642\u0647 \u067E\u06CC\u0634";',
   'const h=Math.floor(m/60);if(h<24)return h+" \u0633\u0627\u0639\u062A \u067E\u06CC\u0634";return Math.floor(h/24)+" \u0631\u0648\u0632 \u067E\u06CC\u0634"}',
   "var armedCoins={};",
+  'function escStr(x){return String(x==null?"":x).split("&").join("&amp;").split("<").join("&lt;").split(">").join("&gt;").split(String.fromCharCode(34)).join("&quot;")}',
   "function render(d){",
   'document.getElementById("clock").textContent=new Date().toLocaleTimeString("en-GB");',
   "const live=d.cfg.live;",
@@ -33919,6 +34230,14 @@ var HL_PAGE = [
   `h+='<div class="r"><span class="k">\u0622\u0633\u062A\u0627\u0646\u0647</span><span class="v" style="display:flex;align-items:center;gap:10px"><button onclick="setPct(-5)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">\u2212</button><b>'+gd.pct+'\u066A</b><button onclick="setPct(5)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">+</button></span></div>';`,
   `h+='<div class="r"><span class="k">\u062D\u062F\u0627\u06A9\u062B\u0631 \u067E\u0648\u0632\u06CC\u0634\u0646 \u0628\u0627\u0632</span><span class="v" style="display:flex;align-items:center;gap:10px"><button onclick="setMaxPos(-1)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">\u2212</button><b>'+(d.cfg.maxPositions)+'</b><button onclick="setMaxPos(1)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">+</button></span></div>';`,
   `h+='<div class="r"><span class="k">\u062D\u062F\u0627\u0642\u0644 ADX (\u062A\u0634\u062E\u06CC\u0635 \u0631\u0648\u0646\u062F)</span><span class="v" style="display:flex;align-items:center;gap:10px"><button onclick="setAdx(-5)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">\u2212</button><b>'+(d.cfg.minAdx===undefined?25:d.cfg.minAdx)+'</b><button onclick="setAdx(5)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">+</button></span></div>';`,
+  // ── کارت خبر ──
+  `var nw=d.news||{};h+='<div class="c"><div class="t">\u0627\u062E\u0628\u0627\u0631 \u0645\u0639\u062A\u0628\u0631 '+((nw.enabled)?"\xB7 \u0641\u06CC\u0644\u062A\u0631 \u0631\u0648\u0634\u0646":"\xB7 \u0641\u06CC\u0644\u062A\u0631 \u062E\u0627\u0645\u0648\u0634")+'</div>';`,
+  `if(nw.globalShock){h+='<div style="color:#f0596b;font-size:12.5px;line-height:1.7;padding:2px 0">\u26A0 \u062E\u0628\u0631 \u0628\u0627\u0632\u0627\u0631\u06AF\u0633\u062A\u0631: '+escStr(nw.globalShock)+'</div>';}`,
+  `if((nw.blocked||[]).length){h+='<div style="color:#f0a95b;font-size:12px;padding:2px 0">\u0633\u06A9\u0647\u200C\u0647\u0627\u06CC \u0645\u0633\u062F\u0648\u062F: '+nw.blocked.join("\u060C ")+'</div>';}`,
+  `var ls=(nw.latest||[]);if(!ls.length){h+='<div style="color:#7d8ca3;font-size:12px;padding:4px 0">\u062E\u0628\u0631\u06CC \u0628\u0627\u0631\u06AF\u0630\u0627\u0631\u06CC \u0646\u0634\u062F\u0647</div>';}`,
+  'for(var i=0;i<ls.length;i++){var it=ls[i];var col=it.impact==="shock"?"#f0596b":(it.impact==="negative"?"#f0a95b":(it.impact==="positive"?"#34d399":"#8fa0b8"));',
+  `h+='<div style="font-size:12px;line-height:1.65;padding:3px 0;border-top:1px solid #1c2739;color:'+col+'">\u2022 '+escStr(it.title.slice(0,95))+' <span style="color:#68788f">\xB7 '+escStr(it.source)+'</span></div>';}`,
+  `h+='<div style="padding-top:8px"><button onclick="toggleNews()" style="width:100%;padding:10px;font-size:12.5px;font-weight:700;border-radius:11px;font-family:inherit;background:'+(nw.enabled?"#12301f":"#1a2334")+';color:'+(nw.enabled?"#34d399":"#8fa0b8")+';border:1px solid '+(nw.enabled?"#1f6b4a":"#243349")+'">'+(nw.enabled?"\u0641\u06CC\u0644\u062A\u0631 \u062E\u0628\u0631\u06CC \u0631\u0648\u0634\u0646 \u0627\u0633\u062A \u2014 \u0628\u0631\u0627\u06CC \u062E\u0627\u0645\u0648\u0634 \u06A9\u0631\u062F\u0646 \u0628\u0632\u0646":"\u0641\u06CC\u0644\u062A\u0631 \u062E\u0628\u0631\u06CC \u062E\u0627\u0645\u0648\u0634 \u0627\u0633\u062A \u2014 \u0628\u0631\u0627\u06CC \u0631\u0648\u0634\u0646 \u06A9\u0631\u062F\u0646 \u0628\u0632\u0646")+'</button></div></div>';`,
   `h+='<div style="padding-top:8px"><button onclick="toggleGuard()" style="width:100%;padding:11px;font-size:13px;font-weight:700;border-radius:11px;font-family:inherit;background:'+(gd.enabled?"#12301f":"#1a2334")+';color:'+(gd.enabled?"#34d399":"#8fa0b8")+';border:1px solid '+(gd.enabled?"#1f6b4a":"#243349")+'">'+(gd.enabled?"\u06AF\u0627\u0631\u062F \u0631\u0648\u0634\u0646 \u0627\u0633\u062A \u2014 \u0628\u0631\u0627\u06CC \u062E\u0627\u0645\u0648\u0634 \u06A9\u0631\u062F\u0646 \u0628\u0632\u0646":"\u06AF\u0627\u0631\u062F \u062E\u0627\u0645\u0648\u0634 \u0627\u0633\u062A \u2014 \u0628\u0631\u0627\u06CC \u0631\u0648\u0634\u0646 \u06A9\u0631\u062F\u0646 \u0628\u0632\u0646")+'</button></div>';`,
   `h+='<div class="r"><span class="k">\u067E\u0648\u0632\u06CC\u0634\u0646 \u0628\u0627\u0632</span><span class="v">'+d.positions.length+" \u0627\u0632 "+d.cfg.maxPositions+'</span></div></div>';`,
   // پوزیشن‌ها
@@ -33944,7 +34263,7 @@ var HL_PAGE = [
   `h+='<div class="c"><div class="t">\u0622\u062E\u0631\u06CC\u0646 \u0627\u0642\u062F\u0627\u0645\u200C\u0647\u0627</div><div class="log">';`,
   'for(const a of d.recent)h+=a.coin+" \xB7 "+a.action+" \xB7 "+(a.reason||"")+"<br>";',
   'h+="</div></div>";}',
-  "window.__mp=(d.cfg&&d.cfg.maxPositions)||3;window.__adx=(d.cfg&&d.cfg.minAdx);window.__gd=d.guard||{enabled:false,pct:5};",
+  "window.__mp=(d.cfg&&d.cfg.maxPositions)||3;window.__adx=(d.cfg&&d.cfg.minAdx);window.__nw=d.news||{};window.__gd=d.guard||{enabled:false,pct:5};",
   'document.getElementById("app").innerHTML=h;',
   'var bb=document.getElementById("btnAll");bb.style.display=d.positions.length?"block":"none";}',
   'async function tick(){try{const r=await fetch("/api/hl/public/state");render(await r.json())}catch(e){}}',
@@ -33979,6 +34298,10 @@ var HL_PAGE = [
   'var t=coin+" \u0628\u0633\u062A\u0647 \u0634\u062F"+(x.pnl!=null?(" \xB7 "+(x.pnl>=0?"+":"\\u2212")+"$"+Math.abs(x.pnl).toFixed(2)):"")+(x.locked?" \xB7 \u0642\u0641\u0644 \u0634\u062F":" \xB7 \u0628\u062F\u0648\u0646 \u0642\u0641\u0644")+(d.rescan?" \xB7 \u0628\u0631\u0631\u0633\u06CC \u0628\u0627\u0632\u0627\u0631\u2026":"");',
   'msg(t,x.ok?"#34d399":"#f0596b");setTimeout(tick,1200);',
   '}).catch(function(){msg("\u062E\u0637\u0627\u06CC \u0634\u0628\u06A9\u0647","#f0596b");b.textContent="\u0628\u0633\u062A\u0646";b.disabled=false})}',
+  "function toggleNews(){var n=window.__nw||{};",
+  'fetch("/api/hl/public/news",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({enabled:!n.enabled})})',
+  '.then(function(r){return r.json()}).then(function(x){if(x.ok){msg("\u0641\u06CC\u0644\u062A\u0631 \u062E\u0628\u0631\u06CC "+(x.news.enabled?"\u0631\u0648\u0634\u0646":"\u062E\u0627\u0645\u0648\u0634")+" \u0634\u062F",x.news.enabled?"#34d399":"#f0596b");setTimeout(tick,500)}else{msg("\u062E\u0637\u0627","#f0596b")}})',
+  '.catch(function(){msg("\u062E\u0637\u0627\u06CC \u0634\u0628\u06A9\u0647","#f0596b")})}',
   "function setAdx(delta){var n=Math.max(0,Math.min(60,Number(window.__adx||25)+delta));",
   'fetch("/api/hl/public/minadx",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({n:n})})',
   '.then(function(r){return r.json()}).then(function(d){if(d.ok){window.__adx=d.minAdx;msg("\u062D\u062F\u0627\u0642\u0644 ADX \u0634\u062F "+d.minAdx,"#34d399");setTimeout(tick,400)}else{msg("\u062E\u0637\u0627: "+(d.error||"?"),"#f0596b")}})',
@@ -35294,6 +35617,7 @@ function isAuthorized(req, url) {
   if (url.pathname === "/api/hl/public/guard") return true;
   if (url.pathname === "/api/hl/public/maxpos") return true;
   if (url.pathname === "/api/hl/public/minadx") return true;
+  if (url.pathname === "/api/hl/public/news") return true;
   if (!url.pathname.startsWith("/api/")) return true;
   const header = req.headers["x-app-password"];
   if (header && header === APP_PASSWORD) return true;
@@ -35371,7 +35695,7 @@ var server = http2.createServer(async (req, res) => {
         return sendJson(res, 429, { ok: false, error: "\u0647\u0645\u06CC\u0646 \u0686\u0646\u062F \u0644\u062D\u0638\u0647 \u067E\u06CC\u0634 \u0627\u062C\u0631\u0627 \u0634\u062F\u061B \u06F1\u06F5 \u062B\u0627\u0646\u06CC\u0647 \u0635\u0628\u0631 \u06A9\u0646" });
       }
       lastCloseAllAt = nowMs;
-      const r = await (void 0)({ reason: "\u062F\u06A9\u0645\u0647\u0654 \u0628\u0633\u062A\u0646 \u0647\u0645\u0647" });
+      const r = await closeAllPositions({ reason: "\u062F\u06A9\u0645\u0647\u0654 \u0628\u0633\u062A\u0646 \u0647\u0645\u0647" });
       if (hlConfig().liveConfirm) {
         runCycle({ dryRun: false }).catch(() => {
         });
@@ -35399,13 +35723,22 @@ var server = http2.createServer(async (req, res) => {
         return sendJson(res, 429, { ok: false, error: "\u06A9\u0645\u06CC \u0635\u0628\u0631 \u06A9\u0646" });
       }
       lastCloseOneAt = nowMs;
-      const r = await (void 0)(coin, { reason: `\u0628\u0633\u062A\u0646 ${coin} \u0627\u0632 \u067E\u0646\u0644` });
+      const r = await closeOnePosition(coin, { reason: `\u0628\u0633\u062A\u0646 ${coin} \u0627\u0632 \u067E\u0646\u0644` });
       if (r.notFound) return sendJson(res, 404, { ok: false, error: `\u067E\u0648\u0632\u06CC\u0634\u0646\u06CC \u0628\u0631\u0627\u06CC ${coin} \u0628\u0627\u0632 \u0646\u06CC\u0633\u062A` });
       if (hlConfig().liveConfirm) {
         runCycle({ dryRun: false }).catch(() => {
         });
       }
       return sendJson(res, 200, { ok: true, rescan: true, ...r });
+    }
+    if (req.method === "POST" && pathname === "/api/hl/public/news") {
+      const body = await readJsonBody(req);
+      const r = await setNewsFilter({
+        enabled: body?.enabled,
+        blockHours: body?.blockHours,
+        shockHours: body?.shockHours
+      });
+      return sendJson(res, 200, { ok: true, news: r });
     }
     if (req.method === "POST" && pathname === "/api/hl/public/minadx") {
       const body = await readJsonBody(req);
@@ -35862,6 +36195,11 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(`Nexus Pro v2.0 Live Trading Server running on http://0.0.0.0:${PORT}`);
 });
 if (process.env.HL_AGENT_KEY) {
+  const pull = () => refreshNews().catch((e) => console.log("[news] \u062E\u0637\u0627:", e.message));
+  setTimeout(pull, 5e3);
+  setInterval(pull, 5 * 60 * 1e3);
+}
+if (process.env.HL_AGENT_KEY) {
   let guardBusy = false;
   setInterval(async () => {
     if (guardBusy) return;
@@ -35875,6 +36213,7 @@ if (process.env.HL_AGENT_KEY) {
         });
       }
     } catch (e) {
+      console.log("[hl-bot] \u06AF\u0627\u0631\u062F \u062E\u0637\u0627:", e.message);
     } finally {
       guardBusy = false;
     }
