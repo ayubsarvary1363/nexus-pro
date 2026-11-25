@@ -33914,6 +33914,30 @@ async function allOpenOrders() {
   }).then((r) => r.json());
   return Array.isArray(oo) ? oo : [];
 }
+async function cancelOrphanOrders() {
+  let acc = await getAccount2();
+  if (!acc.positions.length) {
+    await new Promise((r) => setTimeout(r, 1500));
+    acc = await getAccount2();
+    if (!Number.isFinite(Number(acc.perpsValue)) || Number(acc.perpsValue) < 0) return { cancelled: 0, coins: [] };
+  }
+  const have = new Set(acc.positions.map((p) => String(p.coin).toUpperCase()));
+  const all = await allOpenOrders().catch(() => []);
+  const orphans = all.filter((o) => !have.has(String(o.coin).toUpperCase()));
+  if (!orphans.length) return { cancelled: 0, coins: [] };
+  let universe = [];
+  try {
+    universe = (await getMeta()).universe;
+  } catch {
+  }
+  const list = orphans.map((o) => ({ a: o.assetIndex ?? indexOf(universe, o.coin), oid: o.oid }));
+  try {
+    await cancelOrders(list);
+  } catch (e) {
+    return { cancelled: 0, coins: [...new Set(orphans.map((o) => o.coin))], error: e.message };
+  }
+  return { cancelled: list.length, coins: [...new Set(orphans.map((o) => String(o.coin).toUpperCase()))] };
+}
 async function protectPosition({ coin, isShort, size, entry }, { attempts = 3 } = {}) {
   const slPx = +(entry * (isShort ? 1 + CFG.slPct / 100 : 1 - CFG.slPct / 100)).toFixed(6);
   const tpPx = +(entry * (isShort ? 1 - CFG.tpPct / 100 : 1 + CFG.tpPct / 100)).toFixed(6);
@@ -36349,6 +36373,22 @@ async function runHlCycleGuarded(dryRun, tag) {
   } finally {
     hlCycleBusy = false;
   }
+}
+if (process.env.HL_AGENT_KEY) {
+  let orphBusy = false;
+  setInterval(async () => {
+    if (orphBusy) return;
+    orphBusy = true;
+    try {
+      const r = await cancelOrphanOrders();
+      if (r.cancelled) console.log(`[hl-bot] ${r.cancelled} \u0633\u0641\u0627\u0631\u0634 \u0645\u062D\u0627\u0641\u0638 \u062C\u0627\u0645\u0627\u0646\u062F\u0647 \u0644\u063A\u0648 \u0634\u062F: ${r.coins.join(", ")}`);
+      if (r.error) console.log("[hl-bot] \u0644\u063A\u0648 \u0633\u0641\u0627\u0631\u0634 \u062C\u0627\u0645\u0627\u0646\u062F\u0647 \u062E\u0637\u0627:", r.error);
+    } catch (e) {
+      console.log("[hl-bot] \u067E\u0627\u06A9\u200C\u0633\u0627\u0632\u06CC \u0633\u0641\u0627\u0631\u0634 \u062C\u0627\u0645\u0627\u0646\u062F\u0647 \u062E\u0637\u0627:", e.message);
+    } finally {
+      orphBusy = false;
+    }
+  }, 9e4);
 }
 if (process.env.HL_AGENT_KEY) {
   let tgBusy = false;
