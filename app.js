@@ -33516,7 +33516,10 @@ var CFG = {
   // بعد از بسته شدن یک معامله، تا این مدت دوباره وارد همان سکه نشو (ثانیه‌ای که استاپ خورد و ۱۱ دقیقه بعد دوباره وارد شد)
   cooldownMin: Number(process.env.HL_SL_COOLDOWN_MIN || 120),
   // گارد سود/زیان: اگر مجموع سود/زیان باز از این درصدِ دارایی بیشتر شود، همه بسته می‌شوند
-  pnlGuardPct: Number(process.env.HL_PNL_GUARD_PCT || 10),
+  pnlGuardPct: Number(process.env.HL_PNL_GUARD_PCT || 18),
+  // گارد زیان (٪ دارایی)
+  pnlGuardProfitPct: Number(process.env.HL_PNL_GUARD_PROFIT_PCT || 35),
+  // گارد سود (٪ دارایی)
   // شورت: بک‌تست ۶ ساله — PF 1.25، در هر سال مثبت
   allowShort: String(process.env.HL_SHORT || "1") !== "0",
   shortScore: Number(process.env.HL_SHORT_SCORE || 20),
@@ -34032,7 +34035,10 @@ function guardOf(st) {
   const g = st.guard || {};
   return {
     enabled: g.enabled === void 0 ? String(process.env.HL_PNL_GUARD || "1") !== "0" : Boolean(g.enabled),
-    pct: Number(g.pct || CFG.pnlGuardPct)
+    pct: Number(g.pct || CFG.pnlGuardPct),
+    // آستانهٔ زیان
+    profitPct: Number(g.profitPct || CFG.pnlGuardProfitPct)
+    // آستانهٔ سود
   };
 }
 async function setGuard(patch = {}) {
@@ -34040,7 +34046,8 @@ async function setGuard(patch = {}) {
   const cur = guardOf(st);
   const guard = {
     enabled: patch.enabled === void 0 ? cur.enabled : Boolean(patch.enabled),
-    pct: patch.pct === void 0 ? cur.pct : Math.max(0.5, Math.min(50, Number(patch.pct)))
+    pct: patch.pct === void 0 ? cur.pct : Math.max(0.5, Math.min(90, Number(patch.pct))),
+    profitPct: patch.profitPct === void 0 ? cur.profitPct : Math.max(0.5, Math.min(200, Number(patch.profitPct)))
   };
   saveSettings({ guard });
   st.guard = guard;
@@ -34053,13 +34060,61 @@ async function checkPnlGuard() {
   if (!g.enabled) return { skipped: "guard-off" };
   const acc = await getAccount2();
   if (!acc.positions.length) return { skipped: "no-positions", guard: g };
-  const limit = acc.equity * g.pct / 100;
+  const lossLimit = acc.equity * g.pct / 100;
+  const profitLimit = acc.equity * g.profitPct / 100;
   const upnl = Number(acc.upnl || 0);
-  if (Math.abs(upnl) < limit) return { skipped: "under-limit", upnl, limit, guard: g };
-  const r = await closeAllPositions({
-    reason: `\u06AF\u0627\u0631\u062F ${g.pct}\u066A \xB7 \u0633\u0648\u062F/\u0632\u06CC\u0627\u0646 \u0628\u0627\u0632 ${upnl >= 0 ? "+" : "\u2212"}$${Math.abs(upnl).toFixed(2)}`
+  let side = null;
+  if (upnl >= profitLimit) side = "profit";
+  else if (upnl <= -lossLimit) side = "loss";
+  if (!side) {
+    return { skipped: "under-limit", upnl, lossLimit, profitLimit, guard: g };
+  }
+  const label = side === "profit" ? `\u06AF\u0627\u0631\u062F \u0633\u0648\u062F ${g.profitPct}\u066A \xB7 +$${upnl.toFixed(2)}` : `\u06AF\u0627\u0631\u062F \u0632\u06CC\u0627\u0646 ${g.pct}\u066A \xB7 \u2212$${Math.abs(upnl).toFixed(2)}`;
+  const r = await closeAllPositions({ reason: label });
+  return { triggered: true, side, upnl, lossLimit, profitLimit, guard: g, closed: r.closed };
+}
+function equityTargetOf(stArg) {
+  const g = loadSettings();
+  const usd = Number(g.equityTargetUsd);
+  const step = Number(g.equityTargetStep);
+  return {
+    enabled: g.equityTargetEnabled === void 0 ? false : Boolean(g.equityTargetEnabled),
+    usd: Number.isFinite(usd) && usd > 0 ? usd : 0,
+    // گام: بعد از هر بار بستن، هدف این‌قدر بالاتر می‌رود تا حلقهٔ بستن/بازکردن پیش نیاید
+    step: Number.isFinite(step) && step > 0 ? step : 5,
+    hit: Boolean(g.equityTargetHit),
+    lastHitAt: Number(g.equityTargetLastHitAt || 0)
+  };
+}
+async function setEquityTarget(patch = {}) {
+  const cur = equityTargetOf();
+  const usd = patch.usd === void 0 ? cur.usd : Math.max(0, Math.min(1e9, Number(patch.usd) || 0));
+  const step = patch.step === void 0 ? cur.step : Math.max(0.5, Math.min(1e3, Number(patch.step) || 5));
+  const enabled = patch.enabled === void 0 ? cur.enabled : Boolean(patch.enabled);
+  const p = { equityTargetUsd: usd, equityTargetEnabled: enabled, equityTargetStep: step };
+  if (patch.reset) {
+    p.equityTargetHit = false;
+    p.equityTargetLastHitAt = 0;
+  }
+  saveSettings(p);
+  return equityTargetOf();
+}
+async function checkEquityTarget() {
+  const t = equityTargetOf();
+  if (!t.enabled || !t.usd) return { skipped: "target-off", target: t };
+  if (t.lastHitAt && Date.now() - t.lastHitAt < 25e3) return { skipped: "cooldown", target: t };
+  const acc = await getAccount2();
+  const total = Number(acc.perpsValue || 0) + Number(acc.spotUsdc || 0);
+  const snap = { total, perps: Number(acc.perpsValue || 0), spot: Number(acc.spotUsdc || 0), target: t };
+  if (total < t.usd) return { skipped: "under-target", ...snap };
+  const r = await closeAllPositions({ reason: `\u0647\u062F\u0641 \u0645\u0648\u062C\u0648\u062F\u06CC $${t.usd}` });
+  const next = Math.max(t.usd + t.step, Math.round(total * 1.005 * 100) / 100);
+  saveSettings({
+    equityTargetUsd: Math.round(next * 100) / 100,
+    equityTargetHit: true,
+    equityTargetLastHitAt: Date.now()
   });
-  return { triggered: true, upnl, limit, guard: g, closed: r.closed };
+  return { triggered: true, ...snap, closed: r.closed, nextTarget: Math.round(next * 100) / 100 };
 }
 function newsCfgOf(stArg) {
   const st = stArg || load();
@@ -34110,9 +34165,13 @@ async function publicState() {
   let upnl = 0;
   let marginUsed = 0;
   let freeMargin = 0;
+  let perpsValue = 0;
+  let spotUsdc = 0;
   try {
     const acc = await getAccount2();
     equity = acc.equity;
+    perpsValue = Number(acc.perpsValue || 0);
+    spotUsdc = Number(acc.spotUsdc || 0);
     upnl = acc.upnl || 0;
     marginUsed = acc.marginUsed || 0;
     freeMargin = acc.freeMargin ?? Math.max(0, (acc.spotUsdc || 0) - (acc.marginUsed || 0));
@@ -34161,6 +34220,7 @@ async function publicState() {
     recent,
     guard: guardOf(st),
     news: newsBox,
+    target: { ...equityTargetOf(st), total: Number((perpsValue + spotUsdc).toFixed(2)), perps: perpsValue, spot: spotUsdc },
     openTrades: (st.trades || []).filter((t) => t.status === "open").length
   };
 }
@@ -34225,9 +34285,10 @@ var HL_PAGE = [
   `h+='<div class="r"><span class="k">\u0633\u0648\u062F/\u0632\u06CC\u0627\u0646 \u0628\u0627\u0632</span><span class="v '+(d.upnl>=0?"up":"down")+'">'+mo(d.upnl)+'</span></div>';`,
   `h+='<div class="r"><span class="k">\u062F\u0631 \u0645\u0627\u0631\u062C\u06CC\u0646</span><span class="v">'+mo(d.marginUsed||0)+'</span></div>';`,
   `h+='<div class="r"><span class="k">\u0622\u0632\u0627\u062F (\u0642\u0627\u0628\u0644 \u0628\u0631\u062F\u0627\u0634\u062A)</span><span class="v">'+mo(d.freeMargin||0)+'</span></div>';`,
-  "var gd=d.guard||{enabled:false,pct:5};",
-  `h+='<div class="r"><span class="k">\u06AF\u0627\u0631\u062F '+gd.pct+'\u066A \u0633\u0648\u062F/\u0632\u06CC\u0627\u0646 \u0628\u0627\u0632</span><span class="v" style="color:'+(gd.enabled?"#34d399":"#7d8ca3")+'">'+(gd.enabled?"\u0631\u0648\u0634\u0646":"\u062E\u0627\u0645\u0648\u0634")+'</span></div>';`,
-  `h+='<div class="r"><span class="k">\u0622\u0633\u062A\u0627\u0646\u0647</span><span class="v" style="display:flex;align-items:center;gap:10px"><button onclick="setPct(-5)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">\u2212</button><b>'+gd.pct+'\u066A</b><button onclick="setPct(5)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">+</button></span></div>';`,
+  "var gd=d.guard||{enabled:false,pct:18,profitPct:35};",
+  `h+='<div class="r"><span class="k">\u06AF\u0627\u0631\u062F \u0633\u0648\u062F/\u0632\u06CC\u0627\u0646</span><span class="v" style="color:'+(gd.enabled?"#34d399":"#7d8ca3")+'">'+(gd.enabled?"\u0631\u0648\u0634\u0646":"\u062E\u0627\u0645\u0648\u0634")+'</span></div>';`,
+  `h+='<div class="r"><span class="k">\u0622\u0633\u062A\u0627\u0646\u0647\u0654 \u0632\u06CC\u0627\u0646</span><span class="v" style="display:flex;align-items:center;gap:10px"><button onclick="setPct(-2,0)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">\u2212</button><b>'+gd.pct+'\u066A</b><button onclick="setPct(2,0)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">+</button></span></div>';`,
+  `h+='<div class="r"><span class="k">\u0622\u0633\u062A\u0627\u0646\u0647\u0654 \u0633\u0648\u062F</span><span class="v" style="display:flex;align-items:center;gap:10px"><button onclick="setPct(-5,1)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">\u2212</button><b>'+(gd.profitPct===undefined?gd.pct:gd.profitPct)+'\u066A</b><button onclick="setPct(5,1)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">+</button></span></div>';`,
   `h+='<div class="r"><span class="k">\u062D\u062F\u0627\u06A9\u062B\u0631 \u067E\u0648\u0632\u06CC\u0634\u0646 \u0628\u0627\u0632</span><span class="v" style="display:flex;align-items:center;gap:10px"><button onclick="setMaxPos(-1)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">\u2212</button><b>'+(d.cfg.maxPositions)+'</b><button onclick="setMaxPos(1)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">+</button></span></div>';`,
   `h+='<div class="r"><span class="k">\u062D\u062F\u0627\u0642\u0644 ADX (\u062A\u0634\u062E\u06CC\u0635 \u0631\u0648\u0646\u062F)</span><span class="v" style="display:flex;align-items:center;gap:10px"><button onclick="setAdx(-5)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">\u2212</button><b>'+(d.cfg.minAdx===undefined?25:d.cfg.minAdx)+'</b><button onclick="setAdx(5)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">+</button></span></div>';`,
   // ── کارت خبر ──
@@ -34239,6 +34300,16 @@ var HL_PAGE = [
   `h+='<div style="font-size:12px;line-height:1.65;padding:3px 0;border-top:1px solid #1c2739;color:'+col+'">\u2022 '+escStr(it.title.slice(0,95))+' <span style="color:#68788f">\xB7 '+escStr(it.source)+'</span></div>';}`,
   `h+='<div style="padding-top:8px"><button onclick="toggleNews()" style="width:100%;padding:10px;font-size:12.5px;font-weight:700;border-radius:11px;font-family:inherit;background:'+(nw.enabled?"#12301f":"#1a2334")+';color:'+(nw.enabled?"#34d399":"#8fa0b8")+';border:1px solid '+(nw.enabled?"#1f6b4a":"#243349")+'">'+(nw.enabled?"\u0641\u06CC\u0644\u062A\u0631 \u062E\u0628\u0631\u06CC \u0631\u0648\u0634\u0646 \u0627\u0633\u062A \u2014 \u0628\u0631\u0627\u06CC \u062E\u0627\u0645\u0648\u0634 \u06A9\u0631\u062F\u0646 \u0628\u0632\u0646":"\u0641\u06CC\u0644\u062A\u0631 \u062E\u0628\u0631\u06CC \u062E\u0627\u0645\u0648\u0634 \u0627\u0633\u062A \u2014 \u0628\u0631\u0627\u06CC \u0631\u0648\u0634\u0646 \u06A9\u0631\u062F\u0646 \u0628\u0632\u0646")+'</button></div></div>';`,
   `h+='<div style="padding-top:8px"><button onclick="toggleGuard()" style="width:100%;padding:11px;font-size:13px;font-weight:700;border-radius:11px;font-family:inherit;background:'+(gd.enabled?"#12301f":"#1a2334")+';color:'+(gd.enabled?"#34d399":"#8fa0b8")+';border:1px solid '+(gd.enabled?"#1f6b4a":"#243349")+'">'+(gd.enabled?"\u06AF\u0627\u0631\u062F \u0631\u0648\u0634\u0646 \u0627\u0633\u062A \u2014 \u0628\u0631\u0627\u06CC \u062E\u0627\u0645\u0648\u0634 \u06A9\u0631\u062F\u0646 \u0628\u0632\u0646":"\u06AF\u0627\u0631\u062F \u062E\u0627\u0645\u0648\u0634 \u0627\u0633\u062A \u2014 \u0628\u0631\u0627\u06CC \u0631\u0648\u0634\u0646 \u06A9\u0631\u062F\u0646 \u0628\u0632\u0646")+'</button></div>';`,
+  `h+='<div class="c"><div class="t">\u0647\u062F\u0641 \u0645\u0648\u062C\u0648\u062F\u06CC \u06A9\u0644</div>';`,
+  "var tg=d.target||{enabled:false,usd:0,step:5,hit:false,total:0};",
+  `h+='<div class="r" style="border:0"><span class="k">\u0645\u0648\u062C\u0648\u062F\u06CC \u06A9\u0644 (\u067E\u0631\u067E + \u0627\u0633\u067E\u0627\u062A)</span><span class="v">'+mo(tg.total||0)+'</span></div>';`,
+  `h+='<div class="r"><span class="k">\u0647\u062F\u0641 <span style="font-size:11px;color:#68788f">(\u0632\u062F\u0646 \u0639\u062F\u062F = \u062A\u0627\u06CC\u067E \u062F\u0633\u062A\u06CC)</span></span><span class="v" style="display:flex;align-items:center;gap:10px"><button onclick="setTarget(-5)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">\u2212</button><b onclick="askTarget()" style="cursor:pointer;color:#5fd0a8;text-decoration:underline dotted">'+(tg.usd?mo(tg.usd):"\u062A\u0639\u06CC\u06CC\u0646 \u06A9\u0646\u06CC\u062F")+'</b><button onclick="setTarget(5)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">+</button></span></div>';`,
+  `h+='<div class="r"><span class="k">\u067E\u0644\u0647\u0654 \u0627\u0641\u0632\u0627\u06CC\u0634 \u0628\u0639\u062F \u0627\u0632 \u0647\u0631 \u0628\u0633\u062A\u0646</span><span class="v" style="display:flex;align-items:center;gap:10px"><button onclick="setStep(-1)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">\u2212</button><b>'+mo(tg.step||5)+'</b><button onclick="setStep(1)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">+</button></span></div>';`,
+  `h+='<div class="r"><span class="k">\u0648\u0636\u0639\u06CC\u062A</span><span class="v" style="color:'+(tg.enabled?"#34d399":"#7d8ca3")+'">'+(tg.enabled?"\u0631\u0648\u0634\u0646 \xB7 \u0647\u0631 \u06F1\u06F0 \u062B\u0627\u0646\u06CC\u0647":"\u062E\u0627\u0645\u0648\u0634")+'</span></div>';`,
+  `if(tg.lastHitAt){var ago=Math.max(1,Math.round((Date.now()-tg.lastHitAt)/60000));h+='<div style="font-size:12px;line-height:1.7;color:#f0a95b;padding:4px 0">\u0622\u062E\u0631\u06CC\u0646 \u0628\u0633\u062A\u0646: '+ago+' \u062F\u0642\u06CC\u0642\u0647 \u067E\u06CC\u0634 \xB7 \u0647\u062F\u0641 \u062E\u0648\u062F\u06A9\u0627\u0631 \u0631\u0641\u062A \u0631\u0648\u06CC '+mo(tg.usd)+'</div>';}`,
+  `h+='<div style="font-size:11.5px;line-height:1.6;color:#68788f;padding:4px 0">\u0628\u0627 \u0631\u0633\u06CC\u062F\u0646 \u0645\u0648\u062C\u0648\u062F\u06CC \u0628\u0647 \u0647\u062F\u0641\u060C \u0647\u0645\u0647 \u0628\u0633\u062A\u0647 \u0645\u06CC\u200C\u0634\u0648\u062F \u0648 \u0631\u0628\u0627\u062A \u0628\u0644\u0627\u0641\u0627\u0635\u0644\u0647 \u0628\u0627 \u0647\u0645\u0627\u0646 \u0642\u0648\u0627\u0646\u06CC\u0646 \u0648\u0631\u0648\u062F \u062F\u0648\u0628\u0627\u0631\u0647 \u0645\u0639\u0627\u0645\u0644\u0647 \u0645\u06CC\u200C\u06A9\u0646\u062F.</div>';`,
+  `h+='<div style="padding-top:8px"><button onclick="toggleTarget()" style="width:100%;padding:11px;font-size:13px;font-weight:700;border-radius:11px;font-family:inherit;background:'+(tg.enabled?"#12301f":"#1a2334")+';color:'+(tg.enabled?"#34d399":"#8fa0b8")+';border:1px solid '+(tg.enabled?"#1f6b4a":"#243349")+'">'+(tg.enabled?"\u0647\u062F\u0641 \u0631\u0648\u0634\u0646 \u0627\u0633\u062A \u2014 \u0628\u0631\u0627\u06CC \u062E\u0627\u0645\u0648\u0634 \u06A9\u0631\u062F\u0646 \u0628\u0632\u0646":"\u0647\u062F\u0641 \u062E\u0627\u0645\u0648\u0634 \u0627\u0633\u062A \u2014 \u0628\u0631\u0627\u06CC \u0631\u0648\u0634\u0646 \u06A9\u0631\u062F\u0646 \u0628\u0632\u0646")+'</button></div>';`,
+  "h+='</div>';",
   `h+='<div class="r"><span class="k">\u067E\u0648\u0632\u06CC\u0634\u0646 \u0628\u0627\u0632</span><span class="v">'+d.positions.length+" \u0627\u0632 "+d.cfg.maxPositions+'</span></div></div>';`,
   // پوزیشن‌ها
   "if(d.positions.length){",
@@ -34263,7 +34334,7 @@ var HL_PAGE = [
   `h+='<div class="c"><div class="t">\u0622\u062E\u0631\u06CC\u0646 \u0627\u0642\u062F\u0627\u0645\u200C\u0647\u0627</div><div class="log">';`,
   'for(const a of d.recent)h+=a.coin+" \xB7 "+a.action+" \xB7 "+(a.reason||"")+"<br>";',
   'h+="</div></div>";}',
-  "window.__mp=(d.cfg&&d.cfg.maxPositions)||3;window.__adx=(d.cfg&&d.cfg.minAdx);window.__nw=d.news||{};window.__gd=d.guard||{enabled:false,pct:5};",
+  "window.__mp=(d.cfg&&d.cfg.maxPositions)||3;window.__adx=(d.cfg&&d.cfg.minAdx);window.__nw=d.news||{};window.__gd=d.guard||{enabled:false,pct:18,profitPct:35};window.__tg=d.target||{enabled:false,usd:0,hit:false,total:0};",
   'document.getElementById("app").innerHTML=h;',
   'var bb=document.getElementById("btnAll");bb.style.display=d.positions.length?"block":"none";}',
   'async function tick(){try{const r=await fetch("/api/hl/public/state");render(await r.json())}catch(e){}}',
@@ -34310,10 +34381,33 @@ var HL_PAGE = [
   'fetch("/api/hl/public/maxpos",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({n:n})})',
   '.then(function(r){return r.json()}).then(function(d){if(d.ok){window.__mp=d.maxPositions;msg("\u0633\u0642\u0641 \u067E\u0648\u0632\u06CC\u0634\u0646 \u0634\u062F "+d.maxPositions,"#34d399");setTimeout(tick,400)}else{msg("\u062E\u0637\u0627: "+(d.error||"?"),"#f0596b")}})',
   '.catch(function(){msg("\u062E\u0637\u0627\u06CC \u0634\u0628\u06A9\u0647","#f0596b")})}',
-  "function setPct(delta){var gd=window.__gd||{enabled:true,pct:10};var p=Math.max(2,Math.min(50,Number(gd.pct)+delta));",
-  'fetch("/api/hl/public/guard",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({pct:p})})',
-  '.then(function(r){return r.json()}).then(function(d){if(d.ok){msg("\u0622\u0633\u062A\u0627\u0646\u0647 \u0634\u062F "+d.guard.pct+"\u066A","#34d399");setTimeout(tick,400)}else{msg("\u062E\u0637\u0627: "+(d.error||"?"),"#f0596b")}})',
+  "function setPct(delta,kind){var gd=window.__gd||{enabled:true,pct:18,profitPct:35};var isP=kind===1;var cur=isP?Number(gd.profitPct===undefined?35:gd.profitPct):Number(gd.pct);var p=Math.max(2,Math.min(isP?200:90,cur+delta));",
+  'fetch("/api/hl/public/guard",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(isP?{profitPct:p}:{pct:p})})',
+  '.then(function(r){return r.json()}).then(function(d){if(d.ok){msg((isP?"\u0622\u0633\u062A\u0627\u0646\u0647\u0654 \u0633\u0648\u062F ":"\u0622\u0633\u062A\u0627\u0646\u0647\u0654 \u0632\u06CC\u0627\u0646 ")+(isP?d.guard.profitPct:d.guard.pct)+"\u066A","#34d399");setTimeout(tick,400)}else{msg("\u062E\u0637\u0627: "+(d.error||"?"),"#f0596b")}})',
   '.catch(function(){msg("\u062E\u0637\u0627\u06CC \u0634\u0628\u06A9\u0647","#f0596b")})}',
+  "function setTarget(delta){var tg=window.__tg||{usd:0,enabled:false};var v=Math.max(0,Math.round((Number(tg.usd||0)+delta)*100)/100);",
+  "if(v<1&&delta<0)v=0;",
+  'fetch("/api/hl/public/target",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({usd:v,enabled:v>0?true:tg.enabled})})',
+  '.then(function(r){return r.json()}).then(function(d){if(d.ok){msg(v>0?("\u0647\u062F\u0641 \u0645\u0648\u062C\u0648\u062F\u06CC: "+mo(v)):"\u0647\u062F\u0641 \u067E\u0627\u06A9 \u0634\u062F",d.target.enabled?"#34d399":"#f0596b");setTimeout(tick,500)}else{msg("\u062E\u0637\u0627: "+(d.error||"\u0646\u0627\u0645\u0634\u062E\u0635"),"#f0596b")}})',
+  "}",
+  "function askTarget(){var tg=window.__tg||{usd:0,total:0};var cur=Number(tg.usd||0)||Math.ceil((Number(tg.total||0)+10)/5)*5;",
+  'var v=window.prompt("\u0647\u062F\u0641 \u0645\u0648\u062C\u0648\u062F\u06CC \u06A9\u0644 (\u062F\u0644\u0627\u0631)\u061F\\n\u0645\u0648\u062C\u0648\u062F\u06CC \u0641\u0639\u0644\u06CC: "+(tg.total||0)+" \u062F\u0644\u0627\u0631",String(cur));if(v===null)return;',
+  'var n=Number(String(v).replace(/[^0-9.]/g,""));if(!isFinite(n)||n<=0){msg("\u0639\u062F\u062F \u0646\u0627\u0645\u0639\u062A\u0628\u0631","#f0596b");return}',
+  'fetch("/api/hl/public/target",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({usd:n,enabled:true})})',
+  '.then(function(r){return r.json()}).then(function(d){if(d.ok){msg("\u0647\u062F\u0641 \u0645\u0648\u062C\u0648\u062F\u06CC: "+mo(n),"#34d399");setTimeout(tick,500)}else{msg("\u062E\u0637\u0627: "+(d.error||"\u0646\u0627\u0645\u0634\u062E\u0635"),"#f0596b")}})',
+  "}",
+  "function setStep(delta){var tg=window.__tg||{step:5,usd:0};var v=Math.max(1,Math.min(50,Math.round(Number(tg.step||5)+delta)));",
+  'fetch("/api/hl/public/target",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({step:v})})',
+  '.then(function(r){return r.json()}).then(function(d){if(d.ok){msg("\u067E\u0644\u0647: "+mo(v),"#34d399");setTimeout(tick,400)}else{msg("\u062E\u0637\u0627: "+(d.error||"\u0646\u0627\u0645\u0634\u062E\u0635"),"#f0596b")}})',
+  "}",
+  "function toggleTarget(){var tg=window.__tg||{enabled:false,usd:0};if(!tg.usd){askTarget();return}",
+  'fetch("/api/hl/public/target",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({enabled:!tg.enabled})})',
+  '.then(function(r){return r.json()}).then(function(d){if(d.ok){msg("\u0647\u062F\u0641 \u0645\u0648\u062C\u0648\u062F\u06CC "+(d.target.enabled?"\u0631\u0648\u0634\u0646":"\u062E\u0627\u0645\u0648\u0634")+" \u0634\u062F",d.target.enabled?"#34d399":"#f0596b");setTimeout(tick,500)}else{msg("\u062E\u0637\u0627: "+(d.error||"\u0646\u0627\u0645\u0634\u062E\u0635"),"#f0596b")}})',
+  "}",
+  "function resetTarget(){",
+  'fetch("/api/hl/public/target",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({reset:true,enabled:true})})',
+  '.then(function(r){return r.json()}).then(function(d){if(d.ok){msg("\u0631\u0628\u0627\u062A \u0627\u0632 \u0633\u0631 \u06AF\u0631\u0641\u062A\u0647 \u0634\u062F","#34d399");setTimeout(tick,500)}else{msg("\u062E\u0637\u0627: "+(d.error||"\u0646\u0627\u0645\u0634\u062E\u0635"),"#f0596b")}})',
+  "}",
   "function toggleGuard(){var gd=window.__gd||{enabled:false};",
   'fetch("/api/hl/public/guard",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({enabled:!gd.enabled})})',
   '.then(function(r){return r.json()}).then(function(d){if(d.ok){msg("\u06AF\u0627\u0631\u062F "+(d.guard.enabled?"\u0631\u0648\u0634\u0646":"\u062E\u0627\u0645\u0648\u0634")+" \u0634\u062F \xB7 \u0622\u0633\u062A\u0627\u0646\u0647 "+d.guard.pct+"\u066A",d.guard.enabled?"#34d399":"#f0596b");setTimeout(tick,600)}else{msg("\u062E\u0637\u0627: "+(d.error||"\u0646\u0627\u0645\u0634\u062E\u0635"),"#f0596b")}})',
@@ -35615,6 +35709,7 @@ function isAuthorized(req, url) {
   if (url.pathname === "/api/hl/public/close-all") return true;
   if (url.pathname === "/api/hl/public/close-one") return true;
   if (url.pathname === "/api/hl/public/guard") return true;
+  if (url.pathname === "/api/hl/public/target") return true;
   if (url.pathname === "/api/hl/public/maxpos") return true;
   if (url.pathname === "/api/hl/public/minadx") return true;
   if (url.pathname === "/api/hl/public/news") return true;
@@ -35750,11 +35845,27 @@ var server = http2.createServer(async (req, res) => {
       const r = await setMaxPositions(body?.n ?? body?.maxPositions);
       return sendJson(res, 200, { ok: true, ...r });
     }
+    if (req.method === "POST" && pathname === "/api/hl/public/target") {
+      const body = await readJsonBody(req);
+      const t = await setEquityTarget({
+        enabled: body?.enabled,
+        usd: body?.usd,
+        step: body?.step,
+        reset: Boolean(body?.reset)
+      });
+      let check = null;
+      try {
+        if (t.enabled && t.usd) check = await checkEquityTarget();
+      } catch {
+      }
+      return sendJson(res, 200, { ok: true, target: await setEquityTarget({}), check });
+    }
     if (req.method === "POST" && pathname === "/api/hl/public/guard") {
       const body = await readJsonBody(req);
       const g = await setGuard({
         enabled: body?.enabled,
-        pct: body?.pct
+        pct: body?.pct,
+        profitPct: body?.profitPct
       });
       return sendJson(res, 200, { ok: true, guard: g });
     }
@@ -36208,9 +36319,11 @@ if (process.env.HL_AGENT_KEY) {
       const r = await checkPnlGuard();
       if (r.triggered) {
         const ok = (r.closed || []).filter((c) => c.ok).length;
-        console.log(`[hl-bot] \u06AF\u0627\u0631\u062F ${r.guard.pct}\u066A \u0641\u0639\u0627\u0644 \u0634\u062F: PnL \u0628\u0627\u0632 ${r.upnl.toFixed(2)} (\u062D\u062F ${r.limit.toFixed(2)}) \u2192 ${ok} \u067E\u0648\u0632\u06CC\u0634\u0646 \u0628\u0633\u062A\u0647 \u0634\u062F`);
-        if (hlConfig().liveConfirm) runCycle({ dryRun: false }).catch(() => {
-        });
+        const lim = r.side === "profit" ? r.profitLimit : r.lossLimit;
+        console.log(
+          `[hl-bot] \u06AF\u0627\u0631\u062F ${r.side === "profit" ? "\u0633\u0648\u062F" : "\u0632\u06CC\u0627\u0646"} \u0641\u0639\u0627\u0644 \u0634\u062F: PnL \u0628\u0627\u0632 ${r.upnl.toFixed(2)} (\u062D\u062F ${lim.toFixed(2)}) \u2192 ${ok} \u067E\u0648\u0632\u06CC\u0634\u0646 \u0628\u0633\u062A\u0647 \u0634\u062F`
+        );
+        if (hlConfig().liveConfirm) await runHlCycleGuarded(false, "\u06AF\u0627\u0631\u062F");
       }
     } catch (e) {
       console.log("[hl-bot] \u06AF\u0627\u0631\u062F \u062E\u0637\u0627:", e.message);
@@ -36219,20 +36332,51 @@ if (process.env.HL_AGENT_KEY) {
     }
   }, 6e4);
 }
+var hlCycleBusy = false;
+async function runHlCycleGuarded(dryRun, tag) {
+  if (hlCycleBusy) return null;
+  hlCycleBusy = true;
+  try {
+    const r = await runCycle({ dryRun });
+    const acted = r.actions.filter((a) => a.action !== "WAIT" && a.action !== "SKIP");
+    console.log(`[hl-bot] \u0686\u0631\u062E\u0647${tag ? " (" + tag + ")" : ""}: ${r.positions.length} \u067E\u0648\u0632\u06CC\u0634\u0646 \xB7 ${acted.length} \u0627\u0642\u062F\u0627\u0645 \xB7 \u0645\u0648\u062C\u0648\u062F\u06CC $${r.equity}`);
+    for (const a of acted) console.log(`   ${a.coin} ${a.action} \u2014 ${a.reason}`);
+    if (r.errors.length) console.log("[hl-bot] \u062E\u0637\u0627:", r.errors.slice(0, 3));
+    return r;
+  } catch (e) {
+    console.log("[hl-bot] \u0686\u0631\u062E\u0647 \u0646\u0627\u0645\u0648\u0641\u0642:", e.message);
+    return null;
+  } finally {
+    hlCycleBusy = false;
+  }
+}
+if (process.env.HL_AGENT_KEY) {
+  let tgBusy = false;
+  setInterval(async () => {
+    if (tgBusy) return;
+    tgBusy = true;
+    try {
+      const r = await checkEquityTarget();
+      if (r.triggered) {
+        const okT = (r.closed || []).filter((c) => c.ok).length;
+        console.log(
+          `[hl-bot] \u0647\u062F\u0641 \u0645\u0648\u062C\u0648\u062F\u06CC: \u06A9\u0644 $${r.total.toFixed(2)} \u2265 \u0647\u062F\u0641 $${r.target.usd} \u2192 ${okT} \u067E\u0648\u0632\u06CC\u0634\u0646 \u0628\u0633\u062A\u0647 \u0634\u062F \xB7 \u0647\u062F\u0641 \u0628\u0639\u062F\u06CC $${r.nextTarget}`
+        );
+        await runHlCycleGuarded(!hlConfig().liveConfirm, "\u0647\u062F\u0641 \u0645\u0648\u062C\u0648\u062F\u06CC");
+      }
+    } catch (e) {
+      console.log("[hl-bot] \u0647\u062F\u0641 \u0645\u0648\u062C\u0648\u062F\u06CC \u062E\u0637\u0627:", e.message);
+    } finally {
+      tgBusy = false;
+    }
+  }, 1e4);
+}
 if (String(process.env.HL_AUTORUN || "") === "1" && process.env.HL_AGENT_KEY) {
   const everyMin = Math.max(15, Number(process.env.HL_INTERVAL_MIN) || 60);
   const live = String(process.env.HL_LIVE_CONFIRM || "").toUpperCase() === "YES";
   console.log(`[hl-bot] \u0632\u0645\u0627\u0646\u200C\u0628\u0646\u062F \u0641\u0639\u0627\u0644: \u0647\u0631 ${everyMin} \u062F\u0642\u06CC\u0642\u0647 \xB7 \u062D\u0627\u0644\u062A: ${live ? "\u0648\u0627\u0642\u0639\u06CC" : "\u0646\u0645\u0627\u06CC\u0634\u06CC"}`);
   const tick = async () => {
-    try {
-      const r = await runCycle({ dryRun: !live });
-      const acted = r.actions.filter((a) => a.action !== "WAIT" && a.action !== "SKIP");
-      console.log(`[hl-bot] \u0686\u0631\u062E\u0647: ${r.positions.length} \u067E\u0648\u0632\u06CC\u0634\u0646 \xB7 ${acted.length} \u0627\u0642\u062F\u0627\u0645 \xB7 \u0645\u0648\u062C\u0648\u062F\u06CC $${r.equity}`);
-      for (const a of acted) console.log(`   ${a.coin} ${a.action} \u2014 ${a.reason}`);
-      if (r.errors.length) console.log("[hl-bot] \u062E\u0637\u0627:", r.errors.slice(0, 3));
-    } catch (e) {
-      console.log("[hl-bot] \u0686\u0631\u062E\u0647 \u0646\u0627\u0645\u0648\u0641\u0642:", e.message);
-    }
+    await runHlCycleGuarded(!live, "\u0632\u0645\u0627\u0646\u200C\u0628\u0646\u062F");
   };
   setTimeout(tick, 2e4);
   setInterval(tick, everyMin * 6e4);
