@@ -33515,6 +33515,9 @@ var CFG = {
   // حداکثر درصد سرمایه در مارجین
   // بعد از بسته شدن یک معامله، تا این مدت دوباره وارد همان سکه نشو (ثانیه‌ای که استاپ خورد و ۱۱ دقیقه بعد دوباره وارد شد)
   cooldownMin: Number(process.env.HL_SL_COOLDOWN_MIN || 120),
+  // کول‌داون ورود مجدد: بعد از هر بستن (نه فقط ضرر) چند دقیقه همان سکه دوباره باز نشود
+  // اندازه‌گیری روی ۷۲ ساعت واقعی: کارمزد ۶۳٪ سود ناخالص را می‌خورد؛ ۶ ساعت بهترین بود
+  reentryMin: Number(process.env.HL_REENTRY_MIN || 360),
   // گارد سود/زیان: اگر مجموع سود/زیان باز از این درصدِ دارایی بیشتر شود، همه بسته می‌شوند
   pnlGuardPct: Number(process.env.HL_PNL_GUARD_PCT || 18),
   // گارد زیان (٪ دارایی)
@@ -33559,6 +33562,10 @@ function load() {
   if (g.maxPositions !== void 0) s.maxPositions = g.maxPositions;
   if (g.guard !== void 0) s.guard = g.guard;
   if (g.minAdx !== void 0) s.minAdx = g.minAdx;
+  if (g.reentryMin !== void 0) s.reentryMin = g.reentryMin;
+  else if (s.reentryMin === void 0) s.reentryMin = CFG.reentryMin;
+  if (g.short4h !== void 0) s.short4h = g.short4h;
+  else if (s.short4h === void 0) s.short4h = true;
   if (g.newsFilter !== void 0) s.newsFilter = g.newsFilter;
   if (g.newsBlockHours !== void 0) s.newsBlockHours = g.newsBlockHours;
   if (g.newsShockHours !== void 0) s.newsShockHours = g.newsShockHours;
@@ -33598,6 +33605,13 @@ async function scan({ symbols = HL_UNIVERSE, bars = 300 } = {}) {
           const closes = closed.map((c) => c.close);
           const ma50 = smaLast(closes, Math.min(50, closes.length));
           const price = closed[closed.length - 1].close;
+          let h4up = false;
+          try {
+            const h4 = await getCandles(sym, "4h", 12);
+            const c4 = (h4 || []).slice(0, -1).slice(-2);
+            h4up = c4.length === 2 && c4.every((x) => x.close > x.open);
+          } catch {
+          }
           const key = Object.keys(mids).find((k) => k.toUpperCase() === sym.toUpperCase());
           out.push({
             coin: sym,
@@ -33605,6 +33619,7 @@ async function scan({ symbols = HL_UNIVERSE, bars = 300 } = {}) {
             signal,
             price: key ? Number(mids[key]) : price,
             trendUp: ma50 ? price > ma50 : null,
+            h4up,
             atrPct: a?.summary?.atrPct ?? null,
             rsi: a?.summary?.rsi14 ?? null,
             adx: a?.summary?.adx ?? null
@@ -33753,6 +33768,17 @@ async function runCycleInner({ dryRun = true, scanResult = null } = {}) {
   for (const r of scanData.rows || []) {
     const coin = r.coin.toUpperCase();
     if (openCoins.has(coin)) continue;
+    const reMin = reentryOf(st);
+    if (reMin > 0) {
+      const reAt = (st.recentExit || {})[coin] || 0;
+      const lastTrade = (st.trades || []).filter((x) => String(x.coin).toUpperCase() === coin && x.status === "closed" && x.closedAt).sort((a, b2) => b2.closedAt - a.closedAt)[0];
+      const closedAt = Math.max(reAt, lastTrade ? Number(lastTrade.closedAt) : 0);
+      if (closedAt && Date.now() - closedAt < reMin * 6e4) {
+        const left = Math.ceil((reMin * 6e4 - (Date.now() - closedAt)) / 6e4);
+        actions.push({ coin, action: "SKIP", reason: `\u06A9\u0648\u0644\u200C\u062F\u0627\u0648\u0646 \u0648\u0631\u0648\u062F \u0645\u062C\u062F\u062F \xB7 ${left} \u062F\u0642\u06CC\u0642\u0647 \u0645\u0627\u0646\u062F\u0647` });
+        continue;
+      }
+    }
     const cd = (st.cooldown || {})[coin];
     if (cd && Date.now() - cd < CFG.cooldownMin * 6e4) {
       const left = Math.ceil((CFG.cooldownMin * 6e4 - (Date.now() - cd)) / 6e4);
@@ -33781,9 +33807,13 @@ async function runCycleInner({ dryRun = true, scanResult = null } = {}) {
       }
       continue;
     }
+    if (block4hOf(st) && r.score <= -CFG.shortScore && r.h4up) {
+      actions.push({ coin, action: "SKIP", reason: "\u062C\u0647\u0634 \u06F4 \u0633\u0627\u0639\u062A\u0647 \xB7 \u062F\u0648 \u06A9\u0646\u062F\u0644 \u0633\u0628\u0632 \u067E\u0634\u062A\u200C\u0633\u0631\u0647\u0645" });
+      continue;
+    }
     if (r.score >= CFG.minScore && r.trendUp === true) {
       candidates.push({ ...r, side: "long", reason: `\u0627\u0645\u062A\u06CC\u0627\u0632 ${r.score} \xB7 \u0628\u0627\u0644\u0627\u06CC MA50` });
-    } else if (CFG.allowShort && r.score <= -CFG.shortScore && r.trendUp === false && (r.rsi ?? 100) < CFG.rsiMax) {
+    } else if (CFG.allowShort && r.score <= -CFG.shortScore && r.trendUp === false && (r.rsi ?? 100) < CFG.rsiMax && !(block4hOf(st) && r.h4up)) {
       candidates.push({ ...r, side: "short", reason: `\u0627\u0645\u062A\u06CC\u0627\u0632 ${r.score} \xB7 \u0632\u06CC\u0631 MA50 \xB7 RSI ${r.rsi?.toFixed(0)}` });
     }
   }
@@ -34014,6 +34044,8 @@ async function closeMany(coins = null, { reason = "\u0628\u0633\u062A\u0646 \u06
       if (status && status.error) throw new Error(status.error);
       if (status === "error") throw new Error("\u0633\u0641\u0627\u0631\u0634 \u0627\u0632 \u0637\u0631\u0641 \u0635\u0631\u0627\u0641\u06CC \u0631\u062F \u0634\u062F");
       res.ok = true;
+      st.recentExit = st.recentExit || {};
+      st.recentExit[coin] = Date.now();
       if (res.pnl < 0) {
         st.cooldown[coin] = Date.now();
         res.locked = true;
@@ -34170,6 +34202,27 @@ async function setMinAdx(n2) {
   saveSettings({ minAdx: v });
   return { minAdx: v, source: "settings" };
 }
+function reentryOf(stArg) {
+  const s = stArg || load();
+  const v = Number(s.reentryMin);
+  return Number.isFinite(v) && v >= 0 ? Math.min(1440, Math.round(v)) : CFG.reentryMin;
+}
+async function setReentry(min) {
+  const raw = Number(min);
+  if (!Number.isFinite(raw)) throw new Error("\u0639\u062F\u062F \u0646\u0627\u0645\u0639\u062A\u0628\u0631");
+  const v = Math.max(0, Math.min(1440, Math.round(raw)));
+  saveSettings({ reentryMin: v });
+  return { reentryMin: v };
+}
+function block4hOf(stArg) {
+  const s = stArg || load();
+  return s.short4h !== false;
+}
+async function setShort4h(enabled) {
+  const v = enabled === void 0 ? true : Boolean(enabled);
+  saveSettings({ short4h: v });
+  return { short4h: v };
+}
 function maxPosOf(stArg) {
   const s = stArg || load();
   const v = Number(s.maxPositions);
@@ -34244,6 +34297,8 @@ async function publicState() {
     recent,
     guard: guardOf(st),
     news: newsBox,
+    short4h: block4hOf(st),
+    reentryMin: reentryOf(st),
     target: { ...equityTargetOf(st), total: Number((perpsValue + spotUsdc).toFixed(2)), perps: perpsValue, spot: spotUsdc },
     openTrades: (st.trades || []).filter((t) => t.status === "open").length
   };
@@ -34315,6 +34370,8 @@ var HL_PAGE = [
   `h+='<div class="r"><span class="k">\u0622\u0633\u062A\u0627\u0646\u0647\u0654 \u0633\u0648\u062F</span><span class="v" style="display:flex;align-items:center;gap:10px"><button onclick="setPct(-5,1)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">\u2212</button><b>'+(gd.profitPct===undefined?gd.pct:gd.profitPct)+'\u066A</b><button onclick="setPct(5,1)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">+</button></span></div>';`,
   `h+='<div class="r"><span class="k">\u062D\u062F\u0627\u06A9\u062B\u0631 \u067E\u0648\u0632\u06CC\u0634\u0646 \u0628\u0627\u0632</span><span class="v" style="display:flex;align-items:center;gap:10px"><button onclick="setMaxPos(-1)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">\u2212</button><b>'+(d.cfg.maxPositions)+'</b><button onclick="setMaxPos(1)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">+</button></span></div>';`,
   `h+='<div class="r"><span class="k">\u062D\u062F\u0627\u0642\u0644 ADX (\u062A\u0634\u062E\u06CC\u0635 \u0631\u0648\u0646\u062F)</span><span class="v" style="display:flex;align-items:center;gap:10px"><button onclick="setAdx(-5)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">\u2212</button><b>'+(d.cfg.minAdx===undefined?25:d.cfg.minAdx)+'</b><button onclick="setAdx(5)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">+</button></span></div>';`,
+  `h+='<div class="r"><span class="k">\u0641\u06CC\u0644\u062A\u0631 \u062C\u0647\u0634 \u06F4\u0633\u0627\u0639\u062A\u0647 <span style="font-size:11px;color:#68788f">(\u0634\u0648\u0631\u062A \u0646\u06AF\u06CC\u0631 \u0648\u0642\u062A\u06CC \u06F2 \u06A9\u0646\u062F\u0644 \u0633\u0628\u0632 \u0627\u0633\u062A)</span></span><span class="v"><button onclick="toggleShort4h()" style="padding:7px 13px;border-radius:9px;font-size:12px;font-weight:700;font-family:inherit;background:'+(d.short4h!==false?"#12301f":"#1a2334")+';color:'+(d.short4h!==false?"#34d399":"#8fa0b8")+';border:1px solid '+(d.short4h!==false?"#1f6b4a":"#243349")+'">'+(d.short4h!==false?"\u0631\u0648\u0634\u0646":"\u062E\u0627\u0645\u0648\u0634")+'</button></span></div>';`,
+  `h+='<div class="r"><span class="k">\u06A9\u0648\u0644\u200C\u062F\u0627\u0648\u0646 \u0648\u0631\u0648\u062F \u0645\u062C\u062F\u062F <span style="font-size:11px;color:#68788f">(\u0628\u0639\u062F \u0627\u0632 \u0647\u0631 \u0628\u0633\u062A\u0646)</span></span><span class="v" style="display:flex;align-items:center;gap:10px"><button onclick="setReentry(-60)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">\u2212</button><b>'+((d.reentryMin===undefined?360:d.reentryMin)===0?"\u062E\u0627\u0645\u0648\u0634":Math.round((d.reentryMin===undefined?360:d.reentryMin)/60)+" \u0633\u0627\u0639\u062A")+'</b><button onclick="setReentry(60)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">+</button></span></div>';`,
   // ── کارت خبر ──
   `var nw=d.news||{};h+='<div class="c"><div class="t">\u0627\u062E\u0628\u0627\u0631 \u0645\u0639\u062A\u0628\u0631 '+((nw.enabled)?"\xB7 \u0641\u06CC\u0644\u062A\u0631 \u0631\u0648\u0634\u0646":"\xB7 \u0641\u06CC\u0644\u062A\u0631 \u062E\u0627\u0645\u0648\u0634")+'</div>';`,
   `if(nw.globalShock){h+='<div style="color:#f0596b;font-size:12.5px;line-height:1.7;padding:2px 0">\u26A0 \u062E\u0628\u0631 \u0628\u0627\u0632\u0627\u0631\u06AF\u0633\u062A\u0631: '+escStr(nw.globalShock)+'</div>';}`,
@@ -34358,7 +34415,7 @@ var HL_PAGE = [
   `h+='<div class="c"><div class="t">\u0622\u062E\u0631\u06CC\u0646 \u0627\u0642\u062F\u0627\u0645\u200C\u0647\u0627</div><div class="log">';`,
   'for(const a of d.recent)h+=a.coin+" \xB7 "+a.action+" \xB7 "+(a.reason||"")+"<br>";',
   'h+="</div></div>";}',
-  "window.__mp=(d.cfg&&d.cfg.maxPositions)||3;window.__adx=(d.cfg&&d.cfg.minAdx);window.__nw=d.news||{};window.__gd=d.guard||{enabled:false,pct:18,profitPct:35};window.__tg=d.target||{enabled:false,usd:0,hit:false,total:0};",
+  "window.__mp=(d.cfg&&d.cfg.maxPositions)||3;window.__adx=(d.cfg&&d.cfg.minAdx);window.__nw=d.news||{};window.__gd=d.guard||{enabled:false,pct:18,profitPct:35};window.__tg=d.target||{enabled:false,usd:0,hit:false,total:0};window.__s4=(d.short4h!==false);window.__re=(d.reentryMin===undefined?360:d.reentryMin);",
   'document.getElementById("app").innerHTML=h;',
   'var bb=document.getElementById("btnAll");bb.style.display=d.positions.length?"block":"none";}',
   'async function tick(){try{const r=await fetch("/api/hl/public/state");render(await r.json())}catch(e){}}',
@@ -34396,6 +34453,14 @@ var HL_PAGE = [
   "function toggleNews(){var n=window.__nw||{};",
   'fetch("/api/hl/public/news",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({enabled:!n.enabled})})',
   '.then(function(r){return r.json()}).then(function(x){if(x.ok){msg("\u0641\u06CC\u0644\u062A\u0631 \u062E\u0628\u0631\u06CC "+(x.news.enabled?"\u0631\u0648\u0634\u0646":"\u062E\u0627\u0645\u0648\u0634")+" \u0634\u062F",x.news.enabled?"#34d399":"#f0596b");setTimeout(tick,500)}else{msg("\u062E\u0637\u0627","#f0596b")}})',
+  '.catch(function(){msg("\u062E\u0637\u0627\u06CC \u0634\u0628\u06A9\u0647","#f0596b")})}',
+  "function toggleShort4h(){var n=!(window.__s4!==false);",
+  'fetch("/api/hl/public/short4h",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({enabled:n})})',
+  '.then(function(r){return r.json()}).then(function(x){if(x.ok){window.__s4=x.short4h;msg("\u0641\u06CC\u0644\u062A\u0631 \u062C\u0647\u0634 \u06F4\u0633\u0627\u0639\u062A\u0647 "+(x.short4h?"\u0631\u0648\u0634\u0646":"\u062E\u0627\u0645\u0648\u0634")+" \u0634\u062F",x.short4h?"#34d399":"#f0596b");setTimeout(tick,500)}else{msg("\u062E\u0637\u0627","#f0596b")}})',
+  '.catch(function(){msg("\u062E\u0637\u0627\u06CC \u0634\u0628\u06A9\u0647","#f0596b")})}',
+  "function setReentry(delta){var cur=(window.__re===undefined?360:window.__re);var v=Math.max(0,Math.min(1440,Number(cur||0)+delta));",
+  'fetch("/api/hl/public/reentry",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({minutes:v})})',
+  '.then(function(r){return r.json()}).then(function(x){if(x.ok){window.__re=x.reentryMin;msg("\u06A9\u0648\u0644\u200C\u062F\u0627\u0648\u0646 \u0648\u0631\u0648\u062F \u0645\u062C\u062F\u062F "+(x.reentryMin?Math.round(x.reentryMin/60)+" \u0633\u0627\u0639\u062A":"\u062E\u0627\u0645\u0648\u0634")+" \u0634\u062F","#34d399");setTimeout(tick,400)}else{msg("\u062E\u0637\u0627","#f0596b")}})',
   '.catch(function(){msg("\u062E\u0637\u0627\u06CC \u0634\u0628\u06A9\u0647","#f0596b")})}',
   "function setAdx(delta){var n=Math.max(0,Math.min(60,Number(window.__adx||25)+delta));",
   'fetch("/api/hl/public/minadx",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({n:n})})',
@@ -35736,6 +35801,8 @@ function isAuthorized(req, url) {
   if (url.pathname === "/api/hl/public/target") return true;
   if (url.pathname === "/api/hl/public/maxpos") return true;
   if (url.pathname === "/api/hl/public/minadx") return true;
+  if (url.pathname === "/api/hl/public/short4h") return true;
+  if (url.pathname === "/api/hl/public/reentry") return true;
   if (url.pathname === "/api/hl/public/news") return true;
   if (!url.pathname.startsWith("/api/")) return true;
   const header = req.headers["x-app-password"];
@@ -35862,6 +35929,16 @@ var server = http2.createServer(async (req, res) => {
     if (req.method === "POST" && pathname === "/api/hl/public/minadx") {
       const body = await readJsonBody(req);
       const r = await setMinAdx(body?.n ?? body?.minAdx);
+      return sendJson(res, 200, { ok: true, ...r });
+    }
+    if (req.method === "POST" && pathname === "/api/hl/public/short4h") {
+      const body = await readJsonBody(req);
+      const r = await setShort4h(body?.enabled);
+      return sendJson(res, 200, { ok: true, ...r });
+    }
+    if (req.method === "POST" && pathname === "/api/hl/public/reentry") {
+      const body = await readJsonBody(req);
+      const r = await setReentry(body?.minutes ?? body?.reentryMin);
       return sendJson(res, 200, { ok: true, ...r });
     }
     if (req.method === "POST" && pathname === "/api/hl/public/maxpos") {
