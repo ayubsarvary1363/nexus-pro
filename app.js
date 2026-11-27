@@ -33315,6 +33315,11 @@ async function getCandles(coin, interval = "1h", lookback = 400) {
   const c = await info({ type: "candleSnapshot", req: { coin: name, interval, startTime: start } });
   return c.map((x) => ({ time: Math.floor(x.t / 1e3), open: +x.o, high: +x.h, low: +x.l, close: +x.c, volume: +x.v }));
 }
+function perpsValuePreview(s, spotUsdc, spotHold) {
+  const perps = Number(s.marginSummary?.accountValue || 0);
+  const used = Number(s.marginSummary?.totalMarginUsed || 0);
+  return perps + Math.max(0, spotUsdc - Math.min(spotHold, used));
+}
 async function getAccount2() {
   if (!ACCOUNT) throw new Error("HL_ACCOUNT (\u0622\u062F\u0631\u0633 \u06A9\u06CC\u0641 \u0627\u0635\u0644\u06CC) \u0633\u062A \u0646\u0634\u062F\u0647");
   const s = await info({ type: "clearinghouseState", user: ACCOUNT });
@@ -33329,6 +33334,8 @@ async function getAccount2() {
     value: Number(p.position.positionValue || 0)
   }));
   const spotUsdc = Number((spot.balances || []).find((b2) => b2.coin === "USDC")?.total || 0);
+  const spotHold = Number((spot.balances || []).find((b2) => b2.coin === "USDC")?.hold || 0);
+  const realTotal = Number(perpsValuePreview(s, spotUsdc, spotHold));
   const upnlSum = positions.reduce((a, p) => a + p.pnl, 0);
   const perpsValue = Number(s.marginSummary?.accountValue || 0);
   return {
@@ -33342,6 +33349,8 @@ async function getAccount2() {
     freeMargin: Math.max(0, spotUsdc - Number(s.marginSummary?.totalMarginUsed || 0)),
     perpsValue,
     spotUsdc,
+    spotHold,
+    realTotal,
     upnl: upnlSum,
     marginUsed: Number(s.marginSummary?.totalMarginUsed || 0),
     withdrawable: Number(s.withdrawable || 0),
@@ -34160,8 +34169,10 @@ async function checkEquityTarget() {
   if (!t.enabled || !t.usd) return { skipped: "target-off", target: t };
   if (t.lastHitAt && Date.now() - t.lastHitAt < 25e3) return { skipped: "cooldown", target: t };
   const acc = await getAccount2();
-  const total = Number(acc.perpsValue || 0) + Number(acc.spotUsdc || 0);
-  const snap = { total, perps: Number(acc.perpsValue || 0), spot: Number(acc.spotUsdc || 0), target: t };
+  const total = Number(
+    acc.realTotal !== void 0 ? acc.realTotal : Number(acc.perpsValue || 0) + Math.max(0, Number(acc.spotUsdc || 0) - Math.min(Number(acc.spotHold || 0), Number(acc.marginUsed || 0)))
+  );
+  const snap = { total, perps: Number(acc.perpsValue || 0), spot: Number(acc.spotUsdc || 0), hold: Number(acc.spotHold || 0), target: t };
   if (total < t.usd) return { skipped: "under-target", ...snap };
   const r = await closeAllPositions({ reason: `\u0647\u062F\u0641 \u0645\u0648\u062C\u0648\u062F\u06CC $${t.usd}` });
   const next = Math.max(t.usd + t.step, Math.round(total * 1.005 * 100) / 100);
@@ -34244,11 +34255,15 @@ async function publicState() {
   let freeMargin = 0;
   let perpsValue = 0;
   let spotUsdc = 0;
+  let spotHold = 0;
+  let acc2realTotal = 0;
   try {
     const acc = await getAccount2();
     equity = acc.equity;
     perpsValue = Number(acc.perpsValue || 0);
     spotUsdc = Number(acc.spotUsdc || 0);
+    spotHold = Number(acc.spotHold || 0);
+    acc2realTotal = Number(acc.realTotal !== void 0 ? acc.realTotal : perpsValue + Math.max(0, spotUsdc - Math.min(spotHold, Number(acc.marginUsed || 0))));
     upnl = acc.upnl || 0;
     marginUsed = acc.marginUsed || 0;
     freeMargin = acc.freeMargin ?? Math.max(0, (acc.spotUsdc || 0) - (acc.marginUsed || 0));
@@ -34299,7 +34314,7 @@ async function publicState() {
     news: newsBox,
     short4h: block4hOf(st),
     reentryMin: reentryOf(st),
-    target: { ...equityTargetOf(st), total: Number((perpsValue + spotUsdc).toFixed(2)), perps: perpsValue, spot: spotUsdc },
+    target: { ...equityTargetOf(st), total: Number(acc2realTotal.toFixed(2)), perps: perpsValue, spot: spotUsdc, hold: spotHold },
     openTrades: (st.trades || []).filter((t) => t.status === "open").length
   };
 }
@@ -34383,7 +34398,7 @@ var HL_PAGE = [
   `h+='<div style="padding-top:8px"><button onclick="toggleGuard()" style="width:100%;padding:11px;font-size:13px;font-weight:700;border-radius:11px;font-family:inherit;background:'+(gd.enabled?"#12301f":"#1a2334")+';color:'+(gd.enabled?"#34d399":"#8fa0b8")+';border:1px solid '+(gd.enabled?"#1f6b4a":"#243349")+'">'+(gd.enabled?"\u06AF\u0627\u0631\u062F \u0631\u0648\u0634\u0646 \u0627\u0633\u062A \u2014 \u0628\u0631\u0627\u06CC \u062E\u0627\u0645\u0648\u0634 \u06A9\u0631\u062F\u0646 \u0628\u0632\u0646":"\u06AF\u0627\u0631\u062F \u062E\u0627\u0645\u0648\u0634 \u0627\u0633\u062A \u2014 \u0628\u0631\u0627\u06CC \u0631\u0648\u0634\u0646 \u06A9\u0631\u062F\u0646 \u0628\u0632\u0646")+'</button></div>';`,
   `h+='<div class="c"><div class="t">\u0647\u062F\u0641 \u0645\u0648\u062C\u0648\u062F\u06CC \u06A9\u0644</div>';`,
   "var tg=d.target||{enabled:false,usd:0,step:5,hit:false,total:0};",
-  `h+='<div class="r" style="border:0"><span class="k">\u0645\u0648\u062C\u0648\u062F\u06CC \u06A9\u0644 (\u067E\u0631\u067E + \u0627\u0633\u067E\u0627\u062A)</span><span class="v">'+mo(tg.total||0)+'</span></div>';`,
+  `h+='<div class="r" style="border:0"><span class="k">\u0645\u0648\u062C\u0648\u062F\u06CC \u06A9\u0644 \u0648\u0627\u0642\u0639\u06CC</span><span class="v">'+mo(tg.total||0)+'</span></div>';`,
   `h+='<div class="r"><span class="k">\u0647\u062F\u0641 <span style="font-size:11px;color:#68788f">(\u0632\u062F\u0646 \u0639\u062F\u062F = \u062A\u0627\u06CC\u067E \u062F\u0633\u062A\u06CC)</span></span><span class="v" style="display:flex;align-items:center;gap:10px"><button onclick="setTarget(-5)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">\u2212</button><b onclick="askTarget()" style="cursor:pointer;color:#5fd0a8;text-decoration:underline dotted">'+(tg.usd?mo(tg.usd):"\u062A\u0639\u06CC\u06CC\u0646 \u06A9\u0646\u06CC\u062F")+'</b><button onclick="setTarget(5)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">+</button></span></div>';`,
   `h+='<div class="r"><span class="k">\u067E\u0644\u0647\u0654 \u0627\u0641\u0632\u0627\u06CC\u0634 \u0628\u0639\u062F \u0627\u0632 \u0647\u0631 \u0628\u0633\u062A\u0646</span><span class="v" style="display:flex;align-items:center;gap:10px"><button onclick="setStep(-1)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">\u2212</button><b>'+mo(tg.step||5)+'</b><button onclick="setStep(1)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">+</button></span></div>';`,
   `h+='<div class="r"><span class="k">\u0648\u0636\u0639\u06CC\u062A</span><span class="v" style="color:'+(tg.enabled?"#34d399":"#7d8ca3")+'">'+(tg.enabled?"\u0631\u0648\u0634\u0646 \xB7 \u0647\u0631 \u06F1\u06F0 \u062B\u0627\u0646\u06CC\u0647":"\u062E\u0627\u0645\u0648\u0634")+'</span></div>';`,
