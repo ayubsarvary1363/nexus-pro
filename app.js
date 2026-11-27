@@ -36552,7 +36552,7 @@ if (process.env.HL_AGENT_KEY) {
   }, 1e4);
 }
 if (String(process.env.HL_AUTORUN || "") === "1" && process.env.HL_AGENT_KEY) {
-  const everyMin = Math.max(15, Number(process.env.HL_INTERVAL_MIN) || 60);
+  const everyMin = Math.max(5, Number(process.env.HL_INTERVAL_MIN) || 15);
   const live = String(process.env.HL_LIVE_CONFIRM || "").toUpperCase() === "YES";
   console.log(`[hl-bot] \u0632\u0645\u0627\u0646\u200C\u0628\u0646\u062F \u0641\u0639\u0627\u0644: \u0647\u0631 ${everyMin} \u062F\u0642\u06CC\u0642\u0647 \xB7 \u062D\u0627\u0644\u062A: ${live ? "\u0648\u0627\u0642\u0639\u06CC" : "\u0646\u0645\u0627\u06CC\u0634\u06CC"}`);
   const tick = async () => {
