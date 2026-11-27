@@ -33538,8 +33538,12 @@ var CFG = {
   // آستانهٔ منفی: امتیاز ≤ −۲۰
   rsiMax: Number(process.env.HL_RSI_MAX || 45),
   // شرط RSI برای شورت
-  minAdx: Number(process.env.HL_MIN_ADX || 25)
+  minAdx: Number(process.env.HL_MIN_ADX || 25),
   // کمینهٔ ADX: زیر آن روند «نامشخص» است و وارد نمی‌شویم
+  // خرید انعطاف‌پذیر: در بازاری که از میانگین ۵۰ روزه پایین است ولی روند کوتاه‌مدت صعودی شده،
+  // با قیمت بالای EMA20 و امتیاز ≥ flexLongScore می‌تواند بخرد (بک‌تست: PF ۱٫۰۴ → ۱٫۱۵)
+  flexLong: String(process.env.HL_FLEX_LONG || "1") !== "0",
+  flexLongScore: Number(process.env.HL_FLEX_LONG_SCORE || 0)
 };
 var STATE_FILE2 = process.env.HL_STATE_FILE || path3.join(process.cwd(), "data", "hl-state.json");
 var SETTINGS_FILE = process.env.HL_SETTINGS_FILE || path3.join(path3.dirname(STATE_FILE2), "hl-settings.json");
@@ -33571,6 +33575,8 @@ function load() {
   if (g.maxPositions !== void 0) s.maxPositions = g.maxPositions;
   if (g.guard !== void 0) s.guard = g.guard;
   if (g.minAdx !== void 0) s.minAdx = g.minAdx;
+  if (g.longFlex !== void 0) s.longFlex = g.longFlex;
+  else if (s.longFlex === void 0) s.longFlex = CFG.flexLong;
   if (g.reentryMin !== void 0) s.reentryMin = g.reentryMin;
   else if (s.reentryMin === void 0) s.reentryMin = CFG.reentryMin;
   if (g.short4h !== void 0) s.short4h = g.short4h;
@@ -33613,12 +33619,28 @@ async function scan({ symbols = HL_UNIVERSE, bars = 300 } = {}) {
           const signal = a?.summary?.signal || "NEUTRAL";
           const closes = closed.map((c) => c.close);
           const ma50 = smaLast(closes, Math.min(50, closes.length));
+          const e20 = (() => {
+            const p = Math.min(20, closes.length);
+            const k = 2 / (p + 1);
+            let v = closes.slice(0, p).reduce((a2, b2) => a2 + b2, 0) / p;
+            for (let q = p; q < closes.length; q++) v = closes[q] * k + v * (1 - k);
+            return v;
+          })();
           const price = closed[closed.length - 1].close;
           let h4up = false;
+          let h4AboveE20 = false;
           try {
-            const h4 = await getCandles(sym, "4h", 12);
-            const c4 = (h4 || []).slice(0, -1).slice(-2);
+            const h4 = await getCandles(sym, "4h", 60) || [];
+            const closed4 = h4.slice(0, -1);
+            const c4 = closed4.slice(-2);
             h4up = c4.length === 2 && c4.every((x) => x.close > x.open);
+            if (closed4.length >= 21) {
+              const cl4 = closed4.map((x) => x.close);
+              const k4 = 2 / 21;
+              let e4 = cl4.slice(0, 20).reduce((a2, b2) => a2 + b2, 0) / 20;
+              for (let q = 20; q < cl4.length; q++) e4 = cl4[q] * k4 + e4 * (1 - k4);
+              h4AboveE20 = cl4[cl4.length - 1] > e4;
+            }
           } catch {
           }
           const key = Object.keys(mids).find((k) => k.toUpperCase() === sym.toUpperCase());
@@ -33628,7 +33650,9 @@ async function scan({ symbols = HL_UNIVERSE, bars = 300 } = {}) {
             signal,
             price: key ? Number(mids[key]) : price,
             trendUp: ma50 ? price > ma50 : null,
+            aboveE20: e20 ? price > e20 : null,
             h4up,
+            h4AboveE20,
             atrPct: a?.summary?.atrPct ?? null,
             rsi: a?.summary?.rsi14 ?? null,
             adx: a?.summary?.adx ?? null
@@ -33794,7 +33818,8 @@ async function runCycleInner({ dryRun = true, scanResult = null } = {}) {
       actions.push({ coin, action: "SKIP", reason: `\u06A9\u0648\u0644\u200C\u062F\u0627\u0648\u0646 \u0628\u0639\u062F \u0627\u0632 \u062E\u0631\u0648\u062C \xB7 ${left} \u062F\u0642\u06CC\u0642\u0647 \u0645\u0627\u0646\u062F\u0647` });
       continue;
     }
-    const nearSignal = r.score >= CFG.minScore && r.trendUp === true || CFG.allowShort && r.score <= -CFG.shortScore && r.trendUp === false && (r.rsi ?? 100) < CFG.rsiMax;
+    const flexLongSig = flexLongOf(st) && r.score >= CFG.flexLongScore && r.h4AboveE20 === true;
+    const nearSignal = r.score >= CFG.minScore && r.trendUp === true || flexLongSig || CFG.allowShort && r.score <= -CFG.shortScore && r.trendUp === false && (r.rsi ?? 100) < CFG.rsiMax;
     if (nearSignal && news && news.globalShock) {
       const h = news.globalShock.headlines[0];
       actions.push({ coin, action: "SKIP", reason: `\u062E\u0628\u0631 \u0628\u0627\u0632\u0627\u0631\u06AF\u0633\u062A\u0631 \xB7 ${String(h?.title || "").slice(0, 70)}` });
@@ -33806,7 +33831,7 @@ async function runCycleInner({ dryRun = true, scanResult = null } = {}) {
       continue;
     }
     const adxNow = r.adx === null || r.adx === void 0 ? null : Number(r.adx);
-    if (adxNow === null || adxNow < minAdxOf(st)) {
+    if (!flexLongSig && (adxNow === null || adxNow < minAdxOf(st))) {
       if (nearSignal) {
         actions.push({
           coin,
@@ -33822,6 +33847,8 @@ async function runCycleInner({ dryRun = true, scanResult = null } = {}) {
     }
     if (r.score >= CFG.minScore && r.trendUp === true) {
       candidates.push({ ...r, side: "long", reason: `\u0627\u0645\u062A\u06CC\u0627\u0632 ${r.score} \xB7 \u0628\u0627\u0644\u0627\u06CC MA50` });
+    } else if (flexLongSig) {
+      candidates.push({ ...r, side: "long", reason: `\u0627\u0645\u062A\u06CC\u0627\u0632 ${r.score} \xB7 \u0631\u0648\u0646\u062F \u06F4\u0633\u0627\u0639\u062A\u0647 \u0628\u0627\u0644\u0627\u06CC EMA20` });
     } else if (CFG.allowShort && r.score <= -CFG.shortScore && r.trendUp === false && (r.rsi ?? 100) < CFG.rsiMax && !(block4hOf(st) && r.h4up)) {
       candidates.push({ ...r, side: "short", reason: `\u0627\u0645\u062A\u06CC\u0627\u0632 ${r.score} \xB7 \u0632\u06CC\u0631 MA50 \xB7 RSI ${r.rsi?.toFixed(0)}` });
     }
@@ -34213,6 +34240,15 @@ async function setMinAdx(n2) {
   saveSettings({ minAdx: v });
   return { minAdx: v, source: "settings" };
 }
+function flexLongOf(stArg) {
+  const s = stArg || load();
+  return s.longFlex !== false;
+}
+async function setLongFlex(enabled) {
+  const v = enabled === void 0 ? true : Boolean(enabled);
+  saveSettings({ longFlex: v });
+  return { longFlex: v };
+}
 function reentryOf(stArg) {
   const s = stArg || load();
   const v = Number(s.reentryMin);
@@ -34313,6 +34349,7 @@ async function publicState() {
     guard: guardOf(st),
     news: newsBox,
     short4h: block4hOf(st),
+    longFlex: flexLongOf(st),
     reentryMin: reentryOf(st),
     target: { ...equityTargetOf(st), total: Number(acc2realTotal.toFixed(2)), perps: perpsValue, spot: spotUsdc, hold: spotHold },
     openTrades: (st.trades || []).filter((t) => t.status === "open").length
@@ -34387,6 +34424,7 @@ var HL_PAGE = [
   `h+='<div class="r"><span class="k">\u062D\u062F\u0627\u0642\u0644 ADX (\u062A\u0634\u062E\u06CC\u0635 \u0631\u0648\u0646\u062F)</span><span class="v" style="display:flex;align-items:center;gap:10px"><button onclick="setAdx(-5)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">\u2212</button><b>'+(d.cfg.minAdx===undefined?25:d.cfg.minAdx)+'</b><button onclick="setAdx(5)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">+</button></span></div>';`,
   `h+='<div class="r"><span class="k">\u0641\u06CC\u0644\u062A\u0631 \u062C\u0647\u0634 \u06F4\u0633\u0627\u0639\u062A\u0647 <span style="font-size:11px;color:#68788f">(\u0634\u0648\u0631\u062A \u0646\u06AF\u06CC\u0631 \u0648\u0642\u062A\u06CC \u06F2 \u06A9\u0646\u062F\u0644 \u0633\u0628\u0632 \u0627\u0633\u062A)</span></span><span class="v"><button onclick="toggleShort4h()" style="padding:7px 13px;border-radius:9px;font-size:12px;font-weight:700;font-family:inherit;background:'+(d.short4h!==false?"#12301f":"#1a2334")+';color:'+(d.short4h!==false?"#34d399":"#8fa0b8")+';border:1px solid '+(d.short4h!==false?"#1f6b4a":"#243349")+'">'+(d.short4h!==false?"\u0631\u0648\u0634\u0646":"\u062E\u0627\u0645\u0648\u0634")+'</button></span></div>';`,
   `h+='<div class="r"><span class="k">\u06A9\u0648\u0644\u200C\u062F\u0627\u0648\u0646 \u0648\u0631\u0648\u062F \u0645\u062C\u062F\u062F <span style="font-size:11px;color:#68788f">(\u0628\u0639\u062F \u0627\u0632 \u0647\u0631 \u0628\u0633\u062A\u0646)</span></span><span class="v" style="display:flex;align-items:center;gap:10px"><button onclick="setReentry(-60)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">\u2212</button><b>'+((d.reentryMin===undefined?360:d.reentryMin)===0?"\u062E\u0627\u0645\u0648\u0634":Math.round((d.reentryMin===undefined?360:d.reentryMin)/60)+" \u0633\u0627\u0639\u062A")+'</b><button onclick="setReentry(60)" style="width:30px;height:30px;border-radius:8px;background:#1a2334;color:#8fa0b8;border:1px solid #243349;font-size:16px;font-family:inherit">+</button></span></div>';`,
+  `h+='<div class="r"><span class="k">\u062E\u0631\u06CC\u062F \u062F\u0631 \u0631\u0648\u0646\u062F \u06A9\u0648\u062A\u0627\u0647\u200C\u0645\u062F\u062A <span style="font-size:11px;color:#68788f">(\u06F4\u0633\u0627\u0639\u062A\u0647 \u0628\u0627\u0644\u0627\u06CC EMA20 \xB7 \u0628\u062F\u0648\u0646 \u0646\u06CC\u0627\u0632 \u0628\u0647 MA50)</span></span><span class="v"><button onclick="toggleLongFlex()" style="padding:7px 13px;border-radius:9px;font-size:12px;font-weight:700;font-family:inherit;background:'+(d.longFlex!==false?"#12301f":"#1a2334")+';color:'+(d.longFlex!==false?"#34d399":"#8fa0b8")+';border:1px solid '+(d.longFlex!==false?"#1f6b4a":"#243349")+'">'+(d.longFlex!==false?"\u0631\u0648\u0634\u0646":"\u062E\u0627\u0645\u0648\u0634")+'</button></span></div>';`,
   // ── کارت خبر ──
   `var nw=d.news||{};h+='<div class="c"><div class="t">\u0627\u062E\u0628\u0627\u0631 \u0645\u0639\u062A\u0628\u0631 '+((nw.enabled)?"\xB7 \u0641\u06CC\u0644\u062A\u0631 \u0631\u0648\u0634\u0646":"\xB7 \u0641\u06CC\u0644\u062A\u0631 \u062E\u0627\u0645\u0648\u0634")+'</div>';`,
   `if(nw.globalShock){h+='<div style="color:#f0596b;font-size:12.5px;line-height:1.7;padding:2px 0">\u26A0 \u062E\u0628\u0631 \u0628\u0627\u0632\u0627\u0631\u06AF\u0633\u062A\u0631: '+escStr(nw.globalShock)+'</div>';}`,
@@ -34430,7 +34468,7 @@ var HL_PAGE = [
   `h+='<div class="c"><div class="t">\u0622\u062E\u0631\u06CC\u0646 \u0627\u0642\u062F\u0627\u0645\u200C\u0647\u0627</div><div class="log">';`,
   'for(const a of d.recent)h+=a.coin+" \xB7 "+a.action+" \xB7 "+(a.reason||"")+"<br>";',
   'h+="</div></div>";}',
-  "window.__mp=(d.cfg&&d.cfg.maxPositions)||3;window.__adx=(d.cfg&&d.cfg.minAdx);window.__nw=d.news||{};window.__gd=d.guard||{enabled:false,pct:18,profitPct:35};window.__tg=d.target||{enabled:false,usd:0,hit:false,total:0};window.__s4=(d.short4h!==false);window.__re=(d.reentryMin===undefined?360:d.reentryMin);",
+  "window.__mp=(d.cfg&&d.cfg.maxPositions)||3;window.__adx=(d.cfg&&d.cfg.minAdx);window.__nw=d.news||{};window.__gd=d.guard||{enabled:false,pct:18,profitPct:35};window.__tg=d.target||{enabled:false,usd:0,hit:false,total:0};window.__s4=(d.short4h!==false);window.__re=(d.reentryMin===undefined?360:d.reentryMin);window.__lf=(d.longFlex!==false);",
   'document.getElementById("app").innerHTML=h;',
   'var bb=document.getElementById("btnAll");bb.style.display=d.positions.length?"block":"none";}',
   'async function tick(){try{const r=await fetch("/api/hl/public/state");render(await r.json())}catch(e){}}',
@@ -34476,6 +34514,10 @@ var HL_PAGE = [
   "function setReentry(delta){var cur=(window.__re===undefined?360:window.__re);var v=Math.max(0,Math.min(1440,Number(cur||0)+delta));",
   'fetch("/api/hl/public/reentry",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({minutes:v})})',
   '.then(function(r){return r.json()}).then(function(x){if(x.ok){window.__re=x.reentryMin;msg("\u06A9\u0648\u0644\u200C\u062F\u0627\u0648\u0646 \u0648\u0631\u0648\u062F \u0645\u062C\u062F\u062F "+(x.reentryMin?Math.round(x.reentryMin/60)+" \u0633\u0627\u0639\u062A":"\u062E\u0627\u0645\u0648\u0634")+" \u0634\u062F","#34d399");setTimeout(tick,400)}else{msg("\u062E\u0637\u0627","#f0596b")}})',
+  '.catch(function(){msg("\u062E\u0637\u0627\u06CC \u0634\u0628\u06A9\u0647","#f0596b")})}',
+  "function toggleLongFlex(){var n=!(window.__lf!==false);",
+  'fetch("/api/hl/public/longflex",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({enabled:n})})',
+  '.then(function(r){return r.json()}).then(function(x){if(x.ok){window.__lf=x.longFlex;msg("\u062E\u0631\u06CC\u062F \u062F\u0631 \u0631\u0648\u0646\u062F \u06A9\u0648\u062A\u0627\u0647\u200C\u0645\u062F\u062A "+(x.longFlex?"\u0631\u0648\u0634\u0646":"\u062E\u0627\u0645\u0648\u0634")+" \u0634\u062F",x.longFlex?"#34d399":"#f0596b");setTimeout(tick,500)}else{msg("\u062E\u0637\u0627","#f0596b")}})',
   '.catch(function(){msg("\u062E\u0637\u0627\u06CC \u0634\u0628\u06A9\u0647","#f0596b")})}',
   "function setAdx(delta){var n=Math.max(0,Math.min(60,Number(window.__adx||25)+delta));",
   'fetch("/api/hl/public/minadx",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({n:n})})',
@@ -35818,6 +35860,7 @@ function isAuthorized(req, url) {
   if (url.pathname === "/api/hl/public/minadx") return true;
   if (url.pathname === "/api/hl/public/short4h") return true;
   if (url.pathname === "/api/hl/public/reentry") return true;
+  if (url.pathname === "/api/hl/public/longflex") return true;
   if (url.pathname === "/api/hl/public/news") return true;
   if (!url.pathname.startsWith("/api/")) return true;
   const header = req.headers["x-app-password"];
@@ -35954,6 +35997,11 @@ var server = http2.createServer(async (req, res) => {
     if (req.method === "POST" && pathname === "/api/hl/public/reentry") {
       const body = await readJsonBody(req);
       const r = await setReentry(body?.minutes ?? body?.reentryMin);
+      return sendJson(res, 200, { ok: true, ...r });
+    }
+    if (req.method === "POST" && pathname === "/api/hl/public/longflex") {
+      const body = await readJsonBody(req);
+      const r = await setLongFlex(body?.enabled);
       return sendJson(res, 200, { ok: true, ...r });
     }
     if (req.method === "POST" && pathname === "/api/hl/public/maxpos") {
